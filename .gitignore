@@ -1,0 +1,34 @@
+# Rust build artifacts
+rust/target/
+target/
+*.so
+*.rlib
+*.dylib
+*.dll
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Runtime state and logs
+watchdog.pid
+watchdog.log
+watchdog_status.json
+test_write.txt
+*.pid
+*.log
+
+# User local configs
+settings.json
+
+# System & IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~

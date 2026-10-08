@@ -1,0 +1,12 @@
+[package]
+name = "audio-query-rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "audio_query"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "audio-query-rs"
+path = "src/main.rs"

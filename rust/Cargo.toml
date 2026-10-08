@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = [
+    "audio-query-rs",
+    "audio-watchdog-rs",
+]
