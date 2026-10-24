@@ -15,19 +15,22 @@ pub fn build_alsa_json(card: &str) -> String {
     let headphone = mixer.get_volume_and_switch("Headphone").unwrap_or((0, false));
     let capture = mixer.get_volume_and_switch("Capture").unwrap_or((0, false));
     let auto_mute = mixer.get_auto_mute_mode().unwrap_or_else(|| "Disabled".to_string());
-    let mic_boost = mixer.get_volume_and_switch("Mic Boost").unwrap_or((0, false));
-    let internal_boost = mixer.get_volume_and_switch("Internal Mic Boost").unwrap_or((0, false));
+    let mic_boost = mixer.get_raw_volume("Mic Boost").unwrap_or((0, 3));
+    let internal_boost = mixer.get_raw_volume("Internal Mic Boost").unwrap_or((2, 2));
+    let (capture_source, headset_mic_available) = mixer.get_capture_source();
 
     format!(
-        "{{\"card\":\"{}\",\"master\":{{\"volume\":{},\"unmuted\":{}}},\"speaker\":{{\"volume\":{},\"unmuted\":{}}},\"headphone\":{{\"volume\":{},\"unmuted\":{}}},\"capture\":{{\"volume\":{},\"unmuted\":{}}},\"auto_mute\":\"{}\",\"mic_boost\":{{\"volume\":{}}},\"internal_mic_boost\":{{\"volume\":{}}}}}",
+        "{{\"card\":\"{}\",\"master\":{{\"volume\":{},\"unmuted\":{}}},\"speaker\":{{\"volume\":{},\"unmuted\":{}}},\"headphone\":{{\"volume\":{},\"unmuted\":{}}},\"capture\":{{\"volume\":{},\"unmuted\":{}}},\"auto_mute\":\"{}\",\"mic_boost\":{{\"volume\":{},\"max\":{}}},\"internal_mic_boost\":{{\"volume\":{},\"max\":{}}},\"capture_source\":\"{}\",\"headset_mic_available\":{}}}",
         card,
         master.0, master.1,
         speaker.0, speaker.1,
         headphone.0, headphone.1,
         capture.0, capture.1,
         auto_mute,
-        mic_boost.0,
-        internal_boost.0
+        mic_boost.0, mic_boost.1,
+        internal_boost.0, internal_boost.1,
+        capture_source,
+        headset_mic_available
     )
 }
 
@@ -198,6 +201,59 @@ pub unsafe extern "C" fn audio_set_alsa_auto_mute(
     };
 
     match mixer.set_auto_mute_mode(enabled != 0) {
+        Ok(_) => 0,
+        Err(e) => e,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn audio_set_alsa_capture_source(
+    card: *const c_char,
+    source: *const c_char,
+) -> c_int {
+    if source.is_null() {
+        return -1;
+    }
+
+    let card_str = if card.is_null() { "1" } else { CStr::from_ptr(card).to_str().unwrap_or("1") };
+    let source_str = match CStr::from_ptr(source).to_str() {
+        Ok(s) => s,
+        Err(_) => return -2,
+    };
+
+    let mixer = match alsa::MixerHandle::open(card_str) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+
+    match mixer.set_capture_source(source_str) {
+        Ok(_) => 0,
+        Err(e) => e,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn audio_set_alsa_raw_volume(
+    card: *const c_char,
+    name: *const c_char,
+    raw_val: c_int,
+) -> c_int {
+    if name.is_null() {
+        return -1;
+    }
+
+    let card_str = if card.is_null() { "1" } else { CStr::from_ptr(card).to_str().unwrap_or("1") };
+    let name_str = match CStr::from_ptr(name).to_str() {
+        Ok(s) => s,
+        Err(_) => return -2,
+    };
+
+    let mixer = match alsa::MixerHandle::open(card_str) {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+
+    match mixer.set_raw_volume(name_str, raw_val) {
         Ok(_) => 0,
         Err(e) => e,
     }

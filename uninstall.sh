@@ -39,16 +39,23 @@ fi
 echo -e "${BLUE}--> Removing ~/.local/share/macbook-audio-control...${NC}"
 rm -rf "${HOME}/.local/share/macbook-audio-control"
 
-# Prompt regarding PipeWire/WirePlumber configs
-read -p "Do you also want to remove custom PipeWire & WirePlumber drop-in configs? (y/N): " -r choice
+# Prompt regarding PipeWire/WirePlumber/ALSA configs
+read -p "Do you also want to remove custom PipeWire, WirePlumber & ALSA drop-in configs? (y/N): " -r choice
 if [[ "$choice" =~ ^[Yy]$ ]]; then
     rm -f "${HOME}/.config/pipewire/pipewire.conf.d/10-quantum.conf"
     rm -f "${HOME}/.config/wireplumber/wireplumber.conf.d/51-pro-audio-fix.conf"
     rm -f "${HOME}/.config/wireplumber/wireplumber.conf.d/52-bluez-bitrate.conf"
+    if command -v sudo &>/dev/null; then
+        sudo systemctl disable --now macbook-cs4208-mic.service 2>/dev/null || true
+        sudo rm -f /etc/systemd/system/macbook-cs4208-mic.service
+        sudo rm -f /etc/modprobe.d/50-macbook-cs4208-mic.conf
+        sudo rm -f /usr/lib/firmware/macbook-cs4208-mic.fw
+        sudo systemctl daemon-reload 2>/dev/null || true
+    fi
     echo -e "${GREEN}Removed audio configuration drops.${NC}"
     systemctl --user restart pipewire wireplumber 2>/dev/null || true
 else
-    echo -e "${YELLOW}Preserved PipeWire/WirePlumber configs in ~/.config/.${NC}"
+    echo -e "${YELLOW}Preserved PipeWire/WirePlumber/ALSA configs.${NC}"
 fi
 
 echo -e "\n${GREEN}MacBook Audio Control Center uninstalled successfully.${NC}\n"

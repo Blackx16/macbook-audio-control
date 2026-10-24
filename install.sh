@@ -32,7 +32,7 @@ mkdir -p "${SYSTEMD_DIR}"
 mkdir -p "${PIPEWIRE_CONF_DIR}"
 mkdir -p "${WIREPLUMBER_CONF_DIR}"
 
-echo -e "\n${BLUE}[1/6] Checking system prerequisites...${NC}"
+echo -e "\n${BLUE}[1/7] Checking system prerequisites...${NC}"
 
 # Check Python 3
 if ! command -v python3 &>/dev/null; then
@@ -70,7 +70,7 @@ else
     echo -e "  ✓ PipeWire & ALSA utilities present"
 fi
 
-echo -e "\n${BLUE}[2/6] Compiling Rust acceleration & watchdog modules...${NC}"
+echo -e "\n${BLUE}[2/7] Compiling Rust acceleration & watchdog modules...${NC}"
 cd "${PROJECT_DIR}/rust"
 cargo build --release
 
@@ -81,7 +81,7 @@ if [ ! -f "${BUILD_TARGET}/libaudio_query.so" ] || [ ! -f "${BUILD_TARGET}/audio
 fi
 echo -e "${GREEN}  ✓ Rust modules compiled successfully.${NC}"
 
-echo -e "\n${BLUE}[3/6] Installing application files...${NC}"
+echo -e "\n${BLUE}[3/7] Installing application files...${NC}"
 cp -f "${PROJECT_DIR}/audio_backend.py" "${INSTALL_DIR}/"
 cp -f "${BUILD_TARGET}/libaudio_query.so" "${INSTALL_DIR}/"
 cp -f "${BUILD_TARGET}/audio-watchdog-rs" "${BIN_DIR}/"
@@ -94,13 +94,38 @@ chmod +x "${BIN_DIR}/audio-watchdog-rs"
 
 # Initialize settings.json if not present
 if [ ! -f "${INSTALL_DIR}/settings.json" ]; then
-    echo '{"simultaneous_output": false}' > "${INSTALL_DIR}/settings.json"
+    echo '{"simultaneous_output": false, "smart_mic_auto_switch": true}' > "${INSTALL_DIR}/settings.json"
 fi
 
 echo -e "${GREEN}  ✓ Binaries and backend installed to ${INSTALL_DIR} and ${BIN_DIR}.${NC}"
 
-echo -e "\n${BLUE}[4/6] Installing desktop launcher & systemd service...${NC}"
+echo -e "\n${BLUE}[4/7] Installing CS4208 3.5mm Headset Microphone (Pin 0x18) ALSA patch...${NC}"
+if command -v sudo &>/dev/null; then
+    sudo cp -f "${PROJECT_DIR}/configs/alsa/macbook-cs4208-mic.fw" /usr/lib/firmware/macbook-cs4208-mic.fw
+    sudo cp -f "${PROJECT_DIR}/configs/alsa/50-macbook-cs4208-mic.conf" /etc/modprobe.d/50-macbook-cs4208-mic.conf
+    sudo cp -f "${PROJECT_DIR}/configs/systemd/macbook-cs4208-mic.service" /etc/systemd/system/macbook-cs4208-mic.service
+    sudo systemctl daemon-reload
+    sudo systemctl enable macbook-cs4208-mic.service &>/dev/null || true
+
+    # Apply live runtime pin override if Node 0x18 is not yet enabled
+    if [ -d "/sys/class/sound/card1/hwC1D0" ] && ! amixer -c 1 scontrols 2>/dev/null | grep -q "'Internal Mic'"; then
+        echo "0x18 0x00ab9150" | sudo tee /sys/class/sound/card1/hwC1D0/user_pin_configs >/dev/null
+        systemctl --user stop pipewire.socket wireplumber pipewire 2>/dev/null || true
+        echo 1 | sudo tee /sys/class/sound/card1/hwC1D0/reconfig >/dev/null || true
+        systemctl --user start pipewire wireplumber 2>/dev/null || true
+        sleep 1
+    fi
+    echo -e "${GREEN}  ✓ CS4208 Pin 0x18 (3.5mm Headset Mic) firmware patch & boot service installed.${NC}"
+else
+    echo -e "${YELLOW}  ! Warning: sudo not available; skipping /usr/lib/firmware & /etc/modprobe.d install.${NC}"
+fi
+
+echo -e "\n${BLUE}[5/7] Installing desktop launcher & systemd service...${NC}"
 cp -f "${PROJECT_DIR}/macbook-audio-control.desktop" "${DESKTOP_DIR}/"
+sed -i "s|^Exec=.*|Exec=${BIN_DIR}/macbook-audio-control|g" "${DESKTOP_DIR}/macbook-audio-control.desktop"
+if command -v sudo &>/dev/null; then
+    sudo ln -sf "${BIN_DIR}/macbook-audio-control" /usr/local/bin/macbook-audio-control 2>/dev/null || true
+fi
 
 if command -v update-desktop-database &>/dev/null; then
     update-desktop-database "${DESKTOP_DIR}" &>/dev/null || true
@@ -108,16 +133,17 @@ fi
 
 cp -f "${PROJECT_DIR}/configs/systemd/macbook-audio-watchdog.service" "${SYSTEMD_DIR}/"
 systemctl --user daemon-reload
-systemctl --user enable --now macbook-audio-watchdog.service
+systemctl --user enable macbook-audio-watchdog.service &>/dev/null || true
+systemctl --user restart macbook-audio-watchdog.service
 
 echo -e "${GREEN}  ✓ Desktop entry and systemd background service configured.${NC}"
 
-echo -e "\n${BLUE}[5/6] Deploying PipeWire & WirePlumber configuration drops...${NC}"
+echo -e "\n${BLUE}[6/7] Deploying PipeWire & WirePlumber configuration drops...${NC}"
 cp -f "${PROJECT_DIR}/configs/wireplumber/51-pro-audio-fix.conf" "${WIREPLUMBER_CONF_DIR}/"
 cp -f "${PROJECT_DIR}/configs/pipewire/10-quantum.conf" "${PIPEWIRE_CONF_DIR}/"
 echo -e "${GREEN}  ✓ Configuration drops deployed.${NC}"
 
-echo -e "\n${BLUE}[6/6] Running system verification tests...${NC}"
+echo -e "\n${BLUE}[7/7] Running system verification tests...${NC}"
 python3 "${INSTALL_DIR}/audio_backend.py" --test
 
 echo -e "\n${GREEN}======================================================================${NC}"

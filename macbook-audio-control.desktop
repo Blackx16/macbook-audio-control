@@ -1,12 +1,12 @@
 [Desktop Entry]
 Name=MacBook Audio Control
 GenericName=Audio Device & Profile Manager
-Comment=Manage PipeWire buffer size, sample rate, Pro Audio profiles, ALSA hardware switches, and Bluetooth audio
+Comment=Manage PipeWire buffer size, sample rate, Pro Audio profiles, ALSA hardware switches, 3.5mm Headset Mic, and Bluetooth audio
 Exec=macbook-audio-control
 Icon=audio-card
 Terminal=false
 Type=Application
 Categories=AudioVideo;Audio;Settings;HardwareSettings;Qt;
-Keywords=audio;pipewire;wireplumber;alsa;quantum;bitrate;latency;macbook;cs4208;
+Keywords=audio;pipewire;wireplumber;alsa;quantum;bitrate;latency;macbook;cs4208;microphone;headset;mic;
 StartupNotify=true
 StartupWMClass=macbook-audio-control

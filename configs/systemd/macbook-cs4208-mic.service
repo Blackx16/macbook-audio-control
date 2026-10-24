@@ -1,0 +1,13 @@
+[Unit]
+Description=MacBook Cirrus Logic CS4208 3.5mm Headset Microphone Pin Override
+DefaultDependencies=no
+After=systemd-udevd.service sound.target
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'for hw in /sys/class/sound/card*/hwC*D0; do [ -f "$hw/vendor_id" ] || continue; if grep -qi "0x10134208" "$hw/vendor_id" 2>/dev/null; then card_dir=$(dirname "$hw"); card_num=${card_dir##*card}; if ! amixer -c "$card_num" scontrols 2>/dev/null | grep -q "Internal Mic"; then echo "0x18 0x00ab9150" > "$hw/user_pin_configs" && echo 1 > "$hw/reconfig" || true; fi; fi; done'
+
+[Install]
+WantedBy=multi-user.target

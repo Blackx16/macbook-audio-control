@@ -15,7 +15,8 @@ A comprehensive, high-performance audio management suite and GUI specifically en
 When running modern Linux (CachyOS, Arch, Fedora, Ubuntu) on Apple MacBooks:
 1. **Audio Lag & Buffer Dropouts (XRUNs)**: Switching to low-latency or the `pro-audio` profile causes severe sound stutters, jitters, and broken pipe errors due to unaligned ALSA period sizes and buffer headrooms.
 2. **The "Multi-Output" Jack Bug**: Because `pro-audio` bypasses ALSA UCM profiles, the Cirrus Logic CS4208 DAC outputs audio simultaneously to **both** internal speakers and connected 3.5mm headphones.
-3. **No Native Hardware Switch GUI**: Standard desktop volume sliders do not expose Cirrus Logic hardware DAC controls, Auto-Mute modes, or live PipeWire quantum / bitrate switching.
+3. **3.5mm Aux Headset Microphone Not Working (CS4208 Pin `0x18` Bug)**: The upstream Linux kernel `snd_hda_codec_cs420x` driver (`mba6_pincfgs`) overrides Node `0x18` (External 3.5mm TRRS Headset Mic) from the BIOS default (`0x00ab9030`) to `0x43ab9030` (marked disconnected), causing ALSA to completely ignore the headset microphone and only expose the internal digital mic (`0x1c`).
+4. **No Native Hardware Switch GUI**: Standard desktop volume sliders do not expose Cirrus Logic hardware DAC controls, Capture Source switching, Mic Boost preamps, Auto-Mute modes, or live PipeWire quantum / bitrate switching.
 
 ---
 
@@ -23,14 +24,15 @@ When running modern Linux (CachyOS, Arch, Fedora, Ubuntu) on Apple MacBooks:
 
 **MacBook Audio Control Center** solves this with a multi-tiered architecture:
 
-- 🎛️ **Modern PyQt6 / PyQt5 GUI**: Switch buffer sizes (32 to 4096), clock rates (44.1 kHz to 192 kHz), card profiles, HDMI audio, and Bluetooth codecs with live bitrate and latency calculations.
+- 🎛️ **Modern PyQt6 / PyQt5 GUI**: Switch buffer sizes (32 to 4096), clock rates (44.1 kHz to 192 kHz), card profiles, HDMI audio, microphone inputs, and Bluetooth codecs with live bitrate and latency calculations.
+- 🎙️ **CS4208 3.5mm Headset Microphone Fix (`macbook-cs4208-mic.fw`)**: Restores Node `0x18` (`0x00ab9150`) via an ALSA HDA firmware patch and boot service, exposing both `Mic` (3.5mm Headset Mic, Node `0x18`) and `Internal Mic` (Built-in Digital Mic, Node `0x1c`) with automatic +22 dB analog preamp boost (`Mic Boost = 3`, `Capture = 100%`) for clear headset voice capture.
 - ⚡ **Rust Acceleration Engine (`audio-query-rs`)**: Native C-ABI library querying ALSA mixer nodes and PipeWire in sub-millisecond time (<0.2 ms), eliminating process-fork overhead.
 - 🛡️ **Ultra-Lightweight Background Watchdog (`audio-watchdog-rs`)**: A background daemon (~1.5 MB RAM) that detects audio dropouts, prevents buffer crashes, and listens for 3.5mm jack plug/unplug events.
-- 🎧 **Smart Exclusive Auto-Routing**:
-  - **Headphones Plugged In**: Automatically mutes the internal laptop speakers and routes audio exclusively to headphones.
-  - **Headphones Unplugged**: Automatically unmutes and returns audio to internal speakers.
+- 🎧 **Smart Exclusive Output & Microphone Auto-Routing**:
+  - **Headphones Plugged In**: Automatically mutes the internal laptop speakers, routes audio exclusively to headphones, and switches microphone capture to the **3.5mm Headset Mic (Pin 0x18)** with optimal preamp boost.
+  - **Headphones Unplugged**: Automatically unmutes internal speakers and switches microphone capture back to the **Built-in Digital Mic (Pin 0x1c)**.
   - **Bluetooth Connected**: WirePlumber automatically prioritizes and routes sound to the Bluetooth device.
-  - **Simultaneous Output Toggle**: Optional manual toggle to output through both speakers and headphones simultaneously if desired.
+  - **Simultaneous Output & Manual Mic Toggles**: Optional toggles to output through both speakers and headphones simultaneously or lock a specific microphone source.
 
 ---
 
@@ -131,6 +133,11 @@ macbook-audio-control --route
 # Enable or disable simultaneous output from CLI
 macbook-audio-control --simultaneous off
 macbook-audio-control --simultaneous on
+
+# Switch microphone input source from CLI
+macbook-audio-control --mic headset
+macbook-audio-control --mic internal
+macbook-audio-control --mic auto
 ```
 
 ### Interacting with the Background Watchdog (`audio-watchdog-rs`):
@@ -196,8 +203,9 @@ Expected output:
 [9/10] Testing Bluetooth device scanning...                  OK
 [10/12] Testing Headless Qt GUI Instantiation...             OK
 [11/12] Testing Headphone Jack state query & Settings...     OK
-[12/12] Testing Smart Exclusive Auto-Routing engine...       OK
->>> All 12 verification tests PASSED successfully!
+[12/13] Testing Smart Exclusive Auto-Routing engine...       OK
+[13/13] Testing CS4208 3.5mm Headset Microphone (Pin 0x18)...OK
+>>> All 13 verification tests PASSED successfully!
 ```
 
 ---

@@ -321,6 +321,108 @@ impl MixerHandle {
             Err(-3)
         }
     }
+
+    pub fn get_raw_volume(&self, name: &str) -> Option<(i32, i32)> {
+        let elem = self.find_elem(name);
+        if elem.is_null() {
+            return None;
+        }
+
+        unsafe {
+            if snd_mixer_selem_has_capture_volume(elem) != 0 {
+                let mut min: c_long = 0;
+                let mut max: c_long = 0;
+                snd_mixer_selem_get_capture_volume_range(elem, &mut min, &mut max);
+                let mut val: c_long = 0;
+                snd_mixer_selem_get_capture_volume(elem, 0, &mut val);
+                Some((val as i32, max as i32))
+            } else if snd_mixer_selem_has_playback_volume(elem) != 0 {
+                let mut min: c_long = 0;
+                let mut max: c_long = 0;
+                snd_mixer_selem_get_playback_volume_range(elem, &mut min, &mut max);
+                let mut val: c_long = 0;
+                snd_mixer_selem_get_playback_volume(elem, 0, &mut val);
+                Some((val as i32, max as i32))
+            } else {
+                None
+            }
+        }
+    }
+
+    pub fn set_raw_volume(&self, name: &str, raw_val: i32) -> Result<(), i32> {
+        let elem = self.find_elem(name);
+        if elem.is_null() {
+            return Err(-1);
+        }
+
+        unsafe {
+            let mut applied = false;
+            if snd_mixer_selem_has_playback_volume(elem) != 0 {
+                let mut min: c_long = 0;
+                let mut max: c_long = 0;
+                snd_mixer_selem_get_playback_volume_range(elem, &mut min, &mut max);
+                let clamped = (raw_val as c_long).clamp(min, max);
+                let res = snd_mixer_selem_set_playback_volume_all(elem, clamped);
+                if res < 0 {
+                    return Err(res);
+                }
+                applied = true;
+            }
+            if snd_mixer_selem_has_capture_volume(elem) != 0 {
+                let mut min: c_long = 0;
+                let mut max: c_long = 0;
+                snd_mixer_selem_get_capture_volume_range(elem, &mut min, &mut max);
+                let clamped = (raw_val as c_long).clamp(min, max);
+                let res = snd_mixer_selem_set_capture_volume_all(elem, clamped);
+                if res < 0 {
+                    return Err(res);
+                }
+                applied = true;
+            }
+            if applied {
+                Ok(())
+            } else {
+                Err(-2)
+            }
+        }
+    }
+
+    /// Returns `(active_capture_source, headset_mic_available)`
+    /// When pin 0x18 is enabled, ALSA exposes both `'Mic'` (0x18 Headset) and `'Internal Mic'` (0x1c Built-in)
+    /// as mutually exclusive capture switches (`cswitch-exclusive`).
+    pub fn get_capture_source(&self) -> (String, bool) {
+        let internal_elem = self.find_elem("Internal Mic");
+        if internal_elem.is_null() {
+            // Pin 0x18 override not loaded; only built-in mic exists
+            return ("Internal Mic".to_string(), false);
+        }
+
+        if let Some((_, mic_on)) = self.get_volume_and_switch("Mic") {
+            if mic_on {
+                return ("Mic".to_string(), true);
+            }
+        }
+        ("Internal Mic".to_string(), true)
+    }
+
+    /// Switch active capture source between `'Mic'` (3.5mm Headset Mic) and `'Internal Mic'` (Built-in Digital Mic).
+    pub fn set_capture_source(&self, source: &str) -> Result<(), i32> {
+        let want_headset = source.eq_ignore_ascii_case("Mic")
+            || source.eq_ignore_ascii_case("headset")
+            || source == "0";
+
+        let internal_elem = self.find_elem("Internal Mic");
+        if internal_elem.is_null() {
+            // Only single Mic control exists
+            return self.set_switch("Mic", true);
+        }
+
+        if want_headset {
+            self.set_switch("Mic", true)
+        } else {
+            self.set_switch("Internal Mic", true)
+        }
+    }
 }
 
 impl Drop for MixerHandle {

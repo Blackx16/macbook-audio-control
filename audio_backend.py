@@ -469,6 +469,8 @@ context.modules = [
         """Switch audio profile for a card using pactl, falling back to wpctl."""
         code, out, err = run_cmd(["pactl", "set-card-profile", str(card_name_or_index), profile_name])
         if code == 0:
+            if "00_1b.0" in str(card_name_or_index) or str(card_name_or_index) == "1":
+                self.apply_audio_routing("1")
             return True, f"Profile switched to '{profile_name}' on card {card_name_or_index}"
 
         # If card identifier is an ID or pactl failed, try wpctl by resolving profile index
@@ -489,6 +491,8 @@ context.modules = [
                 c_idx = target_card.get("index")
                 code2, out2, err2 = run_cmd(["wpctl", "set-profile", str(c_idx), str(p_idx)])
                 if code2 == 0:
+                    if "00_1b.0" in target_card.get("name", ""):
+                        self.apply_audio_routing("1")
                     return True, f"Profile switched to '{profile_name}' via wpctl"
 
         return False, f"Failed to switch profile: {err or out}"
@@ -657,12 +661,15 @@ context.modules = [
                             "headphone_switch": data.get("headphone", {}).get("unmuted", True),
                             "headphone_volume": data.get("headphone", {}).get("volume", 100),
                             "auto_mute_mode": data.get("auto_mute", "Disabled"),
-                            "mic_boost": data.get("mic_boost", {}).get("volume", 0),
+                            "mic_boost": data.get("mic_boost", {}).get("volume", 3),
                             "internal_mic_boost": data.get("internal_mic_boost", {}).get("volume", 2),
                             "capture_switch": data.get("capture", {}).get("unmuted", True),
                             "capture_volume": data.get("capture", {}).get("volume", 81),
+                            "capture_source": data.get("capture_source", "Internal Mic"),
+                            "headset_mic_available": data.get("headset_mic_available", False),
                             "headphone_jack_plugged": self.get_headphone_jack_state(card_num),
                             "simultaneous_output": self.get_simultaneous_output(),
+                            "smart_mic_auto_switch": self.get_smart_mic_auto_switch(),
                             "available": True,
                             "accelerated": True,
                         }
@@ -677,10 +684,12 @@ context.modules = [
             "headphone_switch": True,
             "headphone_volume": 100,
             "auto_mute_mode": "Disabled",
-            "mic_boost": 0,
+            "mic_boost": 3,
             "internal_mic_boost": 2,
             "capture_switch": True,
             "capture_volume": 81,
+            "capture_source": "Internal Mic",
+            "headset_mic_available": False,
             "available": False,
             "accelerated": False,
         }
@@ -689,6 +698,7 @@ context.modules = [
             return result
 
         result["available"] = True
+        mic_cap_on = False
 
         # Parse each control block independently without DOTALL bleed
         blocks = stdout.split("Simple mixer control ")
@@ -727,6 +737,11 @@ context.modules = [
                     result["capture_switch"] = (sw_match.group(1).lower() == "on")
                 if vol_match:
                     result["capture_volume"] = int(vol_match.group(1))
+            elif name == "Mic":
+                if sw_match and sw_match.group(1).lower() == "on":
+                    mic_cap_on = True
+            elif name == "Internal Mic":
+                result["headset_mic_available"] = True
             elif name == "Mic Boost":
                 m_val = re.search(r"Front Left:\s*(\d+)", block)
                 if m_val:
@@ -736,12 +751,25 @@ context.modules = [
                 if m_val:
                     result["internal_mic_boost"] = int(m_val.group(1))
 
+        if result["headset_mic_available"] and mic_cap_on:
+            result["capture_source"] = "Mic"
+        else:
+            result["capture_source"] = "Internal Mic"
+
         result["headphone_jack_plugged"] = self.get_headphone_jack_state(card_num)
         result["simultaneous_output"] = self.get_simultaneous_output()
+        result["smart_mic_auto_switch"] = self.get_smart_mic_auto_switch()
         return result
 
     def set_alsa_switch(self, control_name: str, enable: bool, card_num: str = "1") -> Tuple[bool, str]:
-        """Turn ALSA control on or off (e.g. 'Speaker', 'Headphone', 'Master'). Uses Rust fast-path if available."""
+        """Turn ALSA control on or off (e.g. 'Speaker', 'Headphone', 'Master', 'Capture'). Uses Rust fast-path if available."""
+        # If unmuting Speaker or Headphone whose volume was zeroed by PipeWire profile switch, restore volume to 100%
+        if enable and control_name in ("Speaker", "Headphone"):
+            alsa_cur = self.get_alsa_hardware_controls(card_num)
+            vol_key = "speaker_volume" if control_name == "Speaker" else "headphone_volume"
+            if alsa_cur.get(vol_key, 100) == 0:
+                self.set_alsa_volume(control_name, 100, card_num)
+
         if _lib_audio_query is not None:
             try:
                 res = _lib_audio_query.audio_set_alsa_switch(
@@ -755,8 +783,11 @@ context.modules = [
             except Exception:
                 pass
 
-        state = "unmute" if enable else "mute"
-        code, out, err = run_cmd(["amixer", "-c", card_num, "set", control_name, state])
+        if control_name in ("Capture", "Mic", "Internal Mic"):
+            state = "cap" if enable else "nocap"
+        else:
+            state = "unmute" if enable else "mute"
+        code, out, err = run_cmd(["amixer", "-c", card_num, "sset", control_name, state])
         if code == 0:
             return True, f"ALSA {control_name} on card {card_num} set to {state}"
         return False, f"Failed to set ALSA {control_name}: {err or out}"
@@ -803,11 +834,104 @@ context.modules = [
         return False, f"Failed to set Auto-Mute Mode: {err or out}"
 
     def set_alsa_boost(self, control_name: str, level: int, card_num: str = "1") -> Tuple[bool, str]:
-        """Set ALSA Mic Boost level (e.g. 'Internal Mic Boost', level 0-2)."""
-        code, out, err = run_cmd(["amixer", "-c", card_num, "set", control_name, str(level)])
+        """Set ALSA Mic Boost level (e.g. 'Mic Boost' 0-3, 'Internal Mic Boost' 0-2). Uses Rust fast-path if available."""
+        if _lib_audio_query is not None and hasattr(_lib_audio_query, "audio_set_alsa_raw_volume"):
+            try:
+                res = _lib_audio_query.audio_set_alsa_raw_volume(
+                    card_num.encode("utf-8"),
+                    control_name.encode("utf-8"),
+                    int(level)
+                )
+                if res == 0:
+                    return True, f"ALSA {control_name} level set to {level} (Rust fast-path)"
+            except Exception:
+                pass
+
+        code, out, err = run_cmd(["amixer", "-c", card_num, "sset", control_name, str(level)])
         if code == 0:
             return True, f"ALSA {control_name} level set to {level}"
         return False, f"Failed to set ALSA boost: {err or out}"
+
+    def ensure_headset_mic_pin_enabled(self, card_num: str = "1") -> Tuple[bool, str]:
+        """
+        Ensure Cirrus Logic CS4208 Node 0x18 (3.5mm External Headset Mic) is enabled in ALSA.
+        Kernel driver snd_hda_codec_cs420x (mba6_pincfgs) marks 0x18 as 0x43ab9030 (disconnected).
+        Overriding 0x18 to 0x00ab9150 enables both 'Mic' (0x18) and 'Internal Mic' (0x1c).
+        """
+        code, stdout, _ = run_cmd(["amixer", "-c", card_num, "scontrols"])
+        if code == 0 and "'Internal Mic'" in stdout:
+            return True, "CS4208 Pin 0x18 (3.5mm Headset Mic) is enabled"
+
+        sysfs_dir = f"/sys/class/sound/card{card_num}/hwC{card_num}D0"
+        if not os.path.exists(sysfs_dir):
+            return False, f"HDA sysfs node {sysfs_dir} not found"
+
+        cmd_str = (
+            f"echo '0x18 0x00ab9150' | sudo -n tee {sysfs_dir}/user_pin_configs >/dev/null && "
+            f"systemctl --user stop pipewire.socket wireplumber pipewire 2>/dev/null || true; "
+            f"echo 1 | sudo -n tee {sysfs_dir}/reconfig >/dev/null; "
+            f"systemctl --user start pipewire wireplumber 2>/dev/null || true"
+        )
+        code2, out2, err2 = run_cmd(["/bin/sh", "-c", cmd_str], timeout=10.0)
+        code3, stdout3, _ = run_cmd(["amixer", "-c", card_num, "scontrols"])
+        if code3 == 0 and "'Internal Mic'" in stdout3:
+            return True, "CS4208 Pin 0x18 (3.5mm Headset Mic) dynamically enabled via sysfs reconfig"
+        return False, f"Could not dynamically reconfigure Pin 0x18: {err2 or out2}"
+
+    def get_capture_source(self, card_num: str = "1") -> str:
+        """Return currently active ALSA capture source ('Mic' for 3.5mm Headset Mic, 'Internal Mic' for Built-in)."""
+        alsa = self.get_alsa_hardware_controls(card_num)
+        return alsa.get("capture_source", "Internal Mic")
+
+    def set_capture_source(
+        self,
+        source: str,
+        card_num: str = "1",
+        adjust_gain: bool = True
+    ) -> Tuple[bool, str]:
+        """
+        Switch active microphone input between:
+        - 'Mic' (External 3.5mm TRRS Headset Microphone, CS4208 Node 0x18)
+        - 'Internal Mic' (Built-in Digital Microphone, CS4208 Node 0x1c)
+        Works across both Pro Audio and Analog Stereo Duplex PipeWire profiles.
+        """
+        want_headset = source.lower() in ("mic", "headset", "headset mic", "external", "0")
+        target_alsa = "Mic" if want_headset else "Internal Mic"
+
+        # 1. Switch via Rust C-ABI fast-path if available
+        if _lib_audio_query is not None and hasattr(_lib_audio_query, "audio_set_alsa_capture_source"):
+            try:
+                _lib_audio_query.audio_set_alsa_capture_source(
+                    card_num.encode("utf-8"),
+                    target_alsa.encode("utf-8")
+                )
+            except Exception:
+                pass
+
+        # 2. Ensure both Simple Mixer cswitch-exclusive and raw Capture Source enum are synced
+        run_cmd(["amixer", "-c", card_num, "sset", target_alsa, "cap"])
+        enum_idx = "0" if want_headset else "1"
+        run_cmd(["amixer", "-c", card_num, "cset", "name=Capture Source", enum_idx])
+
+        # 3. Configure optimal analog/digital preamp gain if requested
+        if adjust_gain:
+            if want_headset:
+                # Passive analog electret headset mic on Node 0x18 needs +10dB Mic Boost (3) and +12dB Capture (100%)
+                self.set_alsa_boost("Mic Boost", 3, card_num=card_num)
+                self.set_alsa_volume("Capture", 100, card_num=card_num)
+                self.set_alsa_switch("Capture", True, card_num=card_num)
+            else:
+                # Amplified digital PDM internal mic on Node 0x1c works best at 0dB Boost (2) and 0dB Capture (81%)
+                self.set_alsa_boost("Internal Mic Boost", 2, card_num=card_num)
+                self.set_alsa_volume("Capture", 81, card_num=card_num)
+                self.set_alsa_switch("Capture", True, card_num=card_num)
+
+        # 4. Sync PipeWire port if card is currently using analog-stereo profile
+        pw_port = "analog-input-mic" if want_headset else "analog-input-internal-mic"
+        run_cmd(["pactl", "set-source-port", "alsa_input.pci-0000_00_1b.0.analog-stereo", pw_port])
+
+        label = "3.5mm Headset Mic (Pin 0x18)" if want_headset else "Built-in Internal Mic (Pin 0x1c)"
+        return True, f"Microphone input switched to {label}"
 
     # -------------------------------------------------------------------------
     # 5b. Settings & Smart Exclusive Headphone Jack Auto-Routing
@@ -816,6 +940,7 @@ context.modules = [
         """Load user audio preferences from settings.json."""
         defaults = {
             "simultaneous_output": False,
+            "smart_mic_auto_switch": True,
         }
         if os.path.exists(APP_SETTINGS_FILE):
             try:
@@ -848,6 +973,19 @@ context.modules = [
         self.apply_audio_routing()
         return ok
 
+    def get_smart_mic_auto_switch(self) -> bool:
+        """Check whether Smart Microphone Auto-Switch on 3.5mm jack plug/unplug is enabled (default True)."""
+        return bool(self.load_settings().get("smart_mic_auto_switch", True))
+
+    def set_smart_mic_auto_switch(self, enabled: bool) -> bool:
+        """Toggle smart microphone auto-switching and immediately apply routing."""
+        st = self.load_settings()
+        st["smart_mic_auto_switch"] = bool(enabled)
+        ok = self.save_settings(st)
+        if enabled:
+            self.apply_audio_routing()
+        return ok
+
     def get_headphone_jack_state(self, card_num: str = "1") -> bool:
         """Return True if 3.5mm headphone jack is plugged in on ALSA Card 1, False otherwise."""
         code, stdout, _ = run_cmd(["amixer", "-c", card_num, "cget", "iface=CARD,name='Headphone Jack'"])
@@ -867,26 +1005,34 @@ context.modules = [
 
     def apply_audio_routing(self, card_num: str = "1") -> Tuple[bool, str]:
         """
-        Apply exclusive auto-routing or simultaneous output based on settings and jack state.
-        - Default: Exclusive Routing.
-          - Jack plugged in: Internal Speakers muted, Headphones unmuted.
-          - Jack unplugged: Internal Speakers unmuted.
-        - Simultaneous Mode: Both Speakers and Headphones unmuted.
+        Apply exclusive auto-routing or simultaneous output plus smart microphone routing
+        based on settings and 3.5mm headphone jack state.
+        - Output Default: Exclusive Routing (Jack plugged -> Headphones only; unplugged -> Speakers only).
+        - Output Simultaneous Mode: Both Speakers and Headphones unmuted.
+        - Input Smart Auto-Switch (Default True): Jack plugged -> Headset Mic (0x18); unplugged -> Internal Mic (0x1c).
         """
         simultaneous = self.get_simultaneous_output()
+        smart_mic = self.get_smart_mic_auto_switch()
+        jack_plugged = self.get_headphone_jack_state(card_num=card_num)
+
+        mic_msg = ""
+        if smart_mic:
+            target_mic = "Mic" if jack_plugged else "Internal Mic"
+            _, m_msg = self.set_capture_source(target_mic, card_num=card_num, adjust_gain=True)
+            mic_msg = f" | {m_msg}"
+
         if simultaneous:
             self.set_alsa_switch("Speaker", True, card_num=card_num)
             self.set_alsa_switch("Headphone", True, card_num=card_num)
-            return True, "Simultaneous Output: Speakers and Headphones both unmuted"
+            return True, f"Simultaneous Output: Speakers and Headphones both unmuted{mic_msg}"
 
-        jack_plugged = self.get_headphone_jack_state(card_num=card_num)
         if jack_plugged:
             self.set_alsa_switch("Speaker", False, card_num=card_num)
             self.set_alsa_switch("Headphone", True, card_num=card_num)
-            return True, "Exclusive Routing: Headphones plugged in (Speakers muted, Headphones unmuted)"
+            return True, f"Exclusive Routing: Headphones plugged in (Speakers muted, Headphones unmuted){mic_msg}"
         else:
             self.set_alsa_switch("Speaker", True, card_num=card_num)
-            return True, "Exclusive Routing: Headphones unplugged (Speakers unmuted)"
+            return True, f"Exclusive Routing: Headphones unplugged (Speakers unmuted){mic_msg}"
 
     # -------------------------------------------------------------------------
     # 6. Audio Watchdog Daemon Management (`audio-watchdog-rs`)
@@ -1596,6 +1742,10 @@ class MainWindow(QMainWindow):
         self.lbl_jack_overview.setStyleSheet("font-size: 13px; font-weight: bold; color: #a9b1d6;")
         sg_layout.addWidget(self.lbl_jack_overview, 3, 1)
 
+        self.lbl_mic_overview = QLabel("Active Microphone: Internal Digital Mic 🎤")
+        self.lbl_mic_overview.setStyleSheet("font-size: 13px; font-weight: bold; color: #06d6a0;")
+        sg_layout.addWidget(self.lbl_mic_overview, 4, 0, 1, 2)
+
         layout.addWidget(summary_group)
 
         # Presets Section
@@ -1983,6 +2133,97 @@ class MainWindow(QMainWindow):
 
         ag_layout.addWidget(routing_frame)
 
+        # Microphone & 3.5mm Headset Input (CS4208 Pin 0x18 & 0x1c) section
+        mic_frame = QFrame()
+        mic_frame.setStyleSheet("""
+            QFrame {
+                background-color: #1a1b26;
+                border: 1px solid #414868;
+                border-radius: 6px;
+                padding: 10px;
+            }
+        """)
+        mf_layout = QVBoxLayout(mic_frame)
+        mf_layout.setContentsMargins(10, 8, 10, 8)
+        mf_layout.setSpacing(6)
+
+        mf_top = QHBoxLayout()
+        mf_top.addWidget(QLabel("<b>🎤 Microphone & 3.5mm Headset Input (CS4208 Pin 0x18 / 0x1c):</b>"))
+        self.lbl_mic_pin_badge = QLabel("Pin 0x18 Patch: Active")
+        self.lbl_mic_pin_badge.setStyleSheet("background-color: #06d6a0; color: #15161e; border-radius: 4px; padding: 3px 8px; font-weight: bold; font-size: 11px;")
+        mf_top.addWidget(self.lbl_mic_pin_badge)
+        mf_top.addStretch()
+        mf_layout.addLayout(mf_top)
+
+        # Input Source selector row
+        src_row = QHBoxLayout()
+        src_lbl = QLabel("🎙️ Active Input Source:")
+        src_lbl.setFixedWidth(170)
+        src_row.addWidget(src_lbl)
+
+        self.combo_mic_source = QComboBox()
+        self.combo_mic_source.addItem("🎧 3.5mm Headset Microphone (External Jack - Pin 0x18)", "Mic")
+        self.combo_mic_source.addItem("💻 Built-in Digital Microphone (Internal - Pin 0x1c)", "Internal Mic")
+        self.combo_mic_source.currentIndexChanged.connect(self._on_mic_source_changed)
+        src_row.addWidget(self.combo_mic_source, stretch=1)
+        mf_layout.addLayout(src_row)
+
+        # Smart Mic Auto-Switch checkbox
+        self.chk_smart_mic_switch = QCheckBox("🔀 Smart Mic Auto-Switch (Auto-select 3.5mm Headset Mic when headphones plugged in)")
+        self.chk_smart_mic_switch.setStyleSheet("font-size: 12px; font-weight: bold; color: #06d6a0;")
+        self.chk_smart_mic_switch.setChecked(True)
+        self.chk_smart_mic_switch.toggled.connect(self._on_smart_mic_switch_toggled)
+        mf_layout.addWidget(self.chk_smart_mic_switch)
+
+        # Capture Volume & Switch row
+        cap_row = QHBoxLayout()
+        cap_lbl = QLabel("🎚️ ADC Capture Gain:")
+        cap_lbl.setFixedWidth(170)
+        self.btn_capture_switch = QPushButton("Capturing")
+        self.btn_capture_switch.setCheckable(True)
+        self.btn_capture_switch.setChecked(True)
+        self.btn_capture_switch.setStyleSheet("background-color: #06d6a0; color: #15161e; font-weight: bold;")
+        self.btn_capture_switch.toggled.connect(self._toggle_capture_switch)
+        cap_row.addWidget(cap_lbl)
+        cap_row.addWidget(self.btn_capture_switch)
+
+        self.slider_capture = QSlider(Qt.Horizontal)
+        self.slider_capture.setRange(0, 100)
+        self.slider_capture.setValue(100)
+        self.slider_capture.valueChanged.connect(self._change_capture_volume)
+        cap_row.addWidget(self.slider_capture)
+
+        self.lbl_capture_val = QLabel("100%")
+        self.lbl_capture_val.setFixedWidth(45)
+        cap_row.addWidget(self.lbl_capture_val)
+        mf_layout.addLayout(cap_row)
+
+        # Boost selectors row
+        boost_row = QHBoxLayout()
+        boost_row.addWidget(QLabel("🎧 Headset Mic Boost:"))
+        self.combo_headset_boost = QComboBox()
+        self.combo_headset_boost.addItem("0 (-20 dB)", 0)
+        self.combo_headset_boost.addItem("1 (-10 dB)", 1)
+        self.combo_headset_boost.addItem("2 (0 dB)", 2)
+        self.combo_headset_boost.addItem("3 (+10 dB Recommended)", 3)
+        self.combo_headset_boost.setCurrentIndex(3)
+        self.combo_headset_boost.currentIndexChanged.connect(self._on_headset_boost_changed)
+        boost_row.addWidget(self.combo_headset_boost)
+
+        boost_row.addSpacing(16)
+        boost_row.addWidget(QLabel("💻 Internal Mic Boost:"))
+        self.combo_internal_boost = QComboBox()
+        self.combo_internal_boost.addItem("0 (-20 dB)", 0)
+        self.combo_internal_boost.addItem("1 (-10 dB)", 1)
+        self.combo_internal_boost.addItem("2 (0 dB Recommended)", 2)
+        self.combo_internal_boost.setCurrentIndex(2)
+        self.combo_internal_boost.currentIndexChanged.connect(self._on_internal_boost_changed)
+        boost_row.addWidget(self.combo_internal_boost)
+        boost_row.addStretch()
+        mf_layout.addLayout(boost_row)
+
+        ag_layout.addWidget(mic_frame)
+
         # Quick hardware buttons
         hw_btns = QHBoxLayout()
         auto_route_btn = QPushButton("🎯 Auto Route Now (Check Jack)")
@@ -2250,6 +2491,17 @@ class MainWindow(QMainWindow):
                 self.lbl_routing_overview.setText("Audio Routing: Exclusive (" + ("Headphones 🎧" if jack_plugged else "Internal Speakers 🔊") + ")")
                 self.lbl_routing_overview.setStyleSheet("font-size: 13px; font-weight: bold; color: #7aa2f7;")
 
+        if hasattr(self, "lbl_mic_overview"):
+            cap_src = alsa_stat.get("capture_source", "Internal Mic")
+            smart_mic = alsa_stat.get("smart_mic_auto_switch", True)
+            mode_tag = " [Auto-Switch ON]" if smart_mic else " [Manual]"
+            if cap_src == "Mic":
+                self.lbl_mic_overview.setText(f"Active Microphone: 3.5mm Headset Mic (Pin 0x18) 🎙️{mode_tag}")
+                self.lbl_mic_overview.setStyleSheet("font-size: 13px; font-weight: bold; color: #06d6a0;")
+            else:
+                self.lbl_mic_overview.setText(f"Active Microphone: Built-in Digital Mic (Pin 0x1c) 🎤{mode_tag}")
+                self.lbl_mic_overview.setStyleSheet("font-size: 13px; font-weight: bold; color: #7aa2f7;")
+
     def _refresh_quantum_tab(self):
         settings = self.backend.get_pipewire_metadata_settings()
         pw_cfg = self.backend.get_saved_pipewire_config()
@@ -2476,6 +2728,60 @@ class MainWindow(QMainWindow):
                 self.chk_simultaneous_output.setChecked(simultaneous)
                 self.chk_simultaneous_output.blockSignals(False)
 
+            # Microphone & 3.5mm Headset Input controls
+            headset_avail = alsa.get("headset_mic_available", False)
+            cap_src = alsa.get("capture_source", "Internal Mic")
+            smart_mic = alsa.get("smart_mic_auto_switch", True)
+            cap_sw = alsa.get("capture_switch", True)
+            cap_vol = alsa.get("capture_volume", 100)
+            mic_boost = alsa.get("mic_boost", 3)
+            int_boost = alsa.get("internal_mic_boost", 2)
+
+            if hasattr(self, "lbl_mic_pin_badge"):
+                if headset_avail:
+                    self.lbl_mic_pin_badge.setText("Pin 0x18 Patch: Active (Mic + Internal Mic)")
+                    self.lbl_mic_pin_badge.setStyleSheet("background-color: #06d6a0; color: #15161e; border-radius: 4px; padding: 3px 8px; font-weight: bold; font-size: 11px;")
+                else:
+                    self.lbl_mic_pin_badge.setText("Pin 0x18 Patch: Inactive")
+                    self.lbl_mic_pin_badge.setStyleSheet("background-color: #ffbe0b; color: #15161e; border-radius: 4px; padding: 3px 8px; font-weight: bold; font-size: 11px;")
+
+            if hasattr(self, "combo_mic_source"):
+                self.combo_mic_source.blockSignals(True)
+                self.combo_mic_source.setCurrentIndex(0 if cap_src == "Mic" else 1)
+                self.combo_mic_source.blockSignals(False)
+
+            if hasattr(self, "chk_smart_mic_switch"):
+                self.chk_smart_mic_switch.blockSignals(True)
+                self.chk_smart_mic_switch.setChecked(smart_mic)
+                self.chk_smart_mic_switch.blockSignals(False)
+
+            if hasattr(self, "btn_capture_switch"):
+                self.btn_capture_switch.blockSignals(True)
+                self.btn_capture_switch.setChecked(cap_sw)
+                self.btn_capture_switch.setText("Capturing" if cap_sw else "Muted")
+                self.btn_capture_switch.setStyleSheet(
+                    "background-color: #06d6a0; color: #15161e; font-weight: bold;"
+                    if cap_sw else
+                    "background-color: #f7768e; color: #15161e; font-weight: bold;"
+                )
+                self.btn_capture_switch.blockSignals(False)
+
+            if hasattr(self, "slider_capture"):
+                self.slider_capture.blockSignals(True)
+                self.slider_capture.setValue(cap_vol)
+                self.lbl_capture_val.setText(f"{cap_vol}%")
+                self.slider_capture.blockSignals(False)
+
+            if hasattr(self, "combo_headset_boost"):
+                self.combo_headset_boost.blockSignals(True)
+                self.combo_headset_boost.setCurrentIndex(max(0, min(3, int(mic_boost))))
+                self.combo_headset_boost.blockSignals(False)
+
+            if hasattr(self, "combo_internal_boost"):
+                self.combo_internal_boost.blockSignals(True)
+                self.combo_internal_boost.setCurrentIndex(max(0, min(2, int(int_boost))))
+                self.combo_internal_boost.blockSignals(False)
+
         # HDMI status
         hdmi_stat = self.backend.get_hdmi_status()
         if hdmi_stat.get("enabled"):
@@ -2656,13 +2962,46 @@ class MainWindow(QMainWindow):
         self._refresh_hardware_and_sinks()
         self._refresh_header_and_overview()
 
+    def _on_mic_source_changed(self, index: int):
+        target_src = self.combo_mic_source.itemData(index) or "Internal Mic"
+        self.backend.set_capture_source(target_src, "1", adjust_gain=True)
+        self._refresh_hardware_and_sinks()
+        self._refresh_header_and_overview()
+
+    def _on_smart_mic_switch_toggled(self, checked: bool):
+        self.backend.set_smart_mic_auto_switch(checked)
+        self._refresh_hardware_and_sinks()
+        self._refresh_header_and_overview()
+
+    def _toggle_capture_switch(self, checked: bool):
+        self.backend.set_alsa_switch("Capture", checked, "1")
+        self.btn_capture_switch.setText("Capturing" if checked else "Muted")
+        self.btn_capture_switch.setStyleSheet(
+            "background-color: #06d6a0; color: #15161e; font-weight: bold;"
+            if checked else
+            "background-color: #f7768e; color: #15161e; font-weight: bold;"
+        )
+
+    def _change_capture_volume(self, val: int):
+        self.lbl_capture_val.setText(f"{val}%")
+        self.backend.set_alsa_volume("Capture", val, "1")
+
+    def _on_headset_boost_changed(self, index: int):
+        lvl = self.combo_headset_boost.itemData(index)
+        if lvl is not None:
+            self.backend.set_alsa_boost("Mic Boost", int(lvl), "1")
+
+    def _on_internal_boost_changed(self, index: int):
+        lvl = self.combo_internal_boost.itemData(index)
+        if lvl is not None:
+            self.backend.set_alsa_boost("Internal Mic Boost", int(lvl), "1")
+
     def _check_jack_polling(self):
         """Monitor headphone jack state in real-time."""
         current_jack = self.backend.get_headphone_jack_state()
         if not hasattr(self, "_last_jack_state") or self._last_jack_state != current_jack:
             self._last_jack_state = current_jack
-            if not self.backend.get_simultaneous_output():
-                self.backend.apply_audio_routing()
+            self.backend.apply_audio_routing()
             self._refresh_hardware_and_sinks()
             self._refresh_header_and_overview()
 
@@ -2942,7 +3281,7 @@ def run_tests():
     assert isinstance(simul, bool), "Simultaneous setting must be boolean"
     print(f"        OK: Jack state={jack}, Simultaneous output={simul} (Default is False)")
 
-    print("[12/12] Testing Smart Exclusive Auto-Routing engine...")
+    print("[12/13] Testing Smart Exclusive Auto-Routing engine...")
     ok_route, msg_route = backend.apply_audio_routing("1")
     assert ok_route, f"Routing failed: {msg_route}"
     alsa_post = backend.get_alsa_hardware_controls("1")
@@ -2954,7 +3293,24 @@ def run_tests():
             assert alsa_post["speaker_switch"], "Speaker should be unmuted when headphones unplugged"
     print(f"        OK: Auto-routing executed successfully: {msg_route}")
 
-    print(">>> All 12 verification tests PASSED successfully!")
+    print("[13/13] Testing CS4208 3.5mm Headset Microphone (Pin 0x18) & Capture Source switching...")
+    ok_pin, msg_pin = backend.ensure_headset_mic_pin_enabled("1")
+    assert ok_pin, f"Headset mic pin 0x18 not enabled: {msg_pin}"
+    alsa_mic = backend.get_alsa_hardware_controls("1")
+    assert alsa_mic.get("headset_mic_available"), "Headset Mic (Pin 0x18) + Internal Mic (Pin 0x1c) not detected in ALSA"
+    assert 0 <= alsa_mic.get("mic_boost", -1) <= 3, f"Invalid mic_boost raw value: {alsa_mic.get('mic_boost')}"
+    assert 0 <= alsa_mic.get("internal_mic_boost", -1) <= 2, f"Invalid internal_mic_boost raw value: {alsa_mic.get('internal_mic_boost')}"
+
+    # Test switching to Internal Mic and Headset Mic, then restore auto-routed state
+    ok_int, _ = backend.set_capture_source("Internal Mic", "1")
+    assert ok_int and backend.get_capture_source("1") == "Internal Mic", "Failed to switch to Internal Mic"
+    ok_ext, _ = backend.set_capture_source("Mic", "1")
+    assert ok_ext and backend.get_capture_source("1") == "Mic", "Failed to switch to Headset Mic (0x18)"
+    backend.apply_audio_routing("1")
+    final_src = backend.get_capture_source("1")
+    print(f"        OK: {msg_pin} | Active Capture Source={final_src}")
+
+    print(">>> All 13 verification tests PASSED successfully!")
     return 0
 
 
@@ -2968,6 +3324,7 @@ def main():
     parser.add_argument("--rate", "-r", type=int, help="Set sample rate")
     parser.add_argument("--route", action="store_true", help="Execute auto-routing check once based on jack state")
     parser.add_argument("--simultaneous", choices=["on", "off"], help="Enable or disable simultaneous multi-output")
+    parser.add_argument("--mic", choices=["headset", "internal", "auto"], help="Switch microphone input ('headset', 'internal', or 'auto')")
     args = parser.parse_args()
 
     backend = AudioBackend()
@@ -2987,6 +3344,18 @@ def main():
         print(f"Simultaneous output set to {mode}")
         sys.exit(0 if ok else 1)
 
+    if args.mic:
+        if args.mic == "auto":
+            backend.set_smart_mic_auto_switch(True)
+            ok, msg = backend.apply_audio_routing()
+            print(f"Smart Mic Auto-Switch enabled: {msg}")
+            sys.exit(0 if ok else 1)
+        else:
+            target = "Mic" if args.mic == "headset" else "Internal Mic"
+            ok, msg = backend.set_capture_source(target, "1", adjust_gain=True)
+            print(msg)
+            sys.exit(0 if ok else 1)
+
     if args.status:
         meta = backend.get_pipewire_metadata_settings()
         status = backend.get_wpctl_status()
@@ -2995,12 +3364,15 @@ def main():
         _, b_str = AudioBackend.calculate_pcm_bitrate(r, 24)
         jack = backend.get_headphone_jack_state("1")
         simul = backend.get_simultaneous_output()
+        cap_src = backend.get_capture_source("1")
+        smart_mic = backend.get_smart_mic_auto_switch()
         print(f"Active Quantum: {q}")
         print(f"Active Rate:    {r} Hz")
         print(f"Active Bitrate: {b_str}")
         def_sink = status.get("default_sink")
         print(f"Default Sink:   {def_sink['name'] if def_sink else 'None'}")
         print(f"3.5mm Jack:     {'Plugged In' if jack else 'Disconnected'}")
+        print(f"Active Mic:     {'3.5mm Headset Mic (Pin 0x18)' if cap_src == 'Mic' else 'Internal Digital Mic (Pin 0x1c)'} (Auto-Switch: {'ON' if smart_mic else 'OFF'})")
         print(f"Simultaneous:   {'Enabled' if simul else 'Disabled (Default Exclusive)'}")
         sys.exit(0)
 

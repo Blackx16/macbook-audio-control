@@ -43,6 +43,21 @@ fn main() {
                     i += 1;
                 }
             }
+            "--set-capture-source" => {
+                cmd = "set-capture-source";
+                if i + 1 < args.len() {
+                    target_val = &args[i + 1];
+                    i += 1;
+                }
+            }
+            "--set-boost" => {
+                cmd = "set-boost";
+                if i + 2 < args.len() {
+                    target_name = &args[i + 1];
+                    target_val = &args[i + 2];
+                    i += 2;
+                }
+            }
             "-h" | "--help" => {
                 println!("audio-query-rs - Fast ALSA & PipeWire query tool");
                 println!("Usage:");
@@ -50,6 +65,8 @@ fn main() {
                 println!("  audio-query-rs --set-vol <Control> <0-100>");
                 println!("  audio-query-rs --set-switch <Control> <0|1>");
                 println!("  audio-query-rs --set-auto-mute <0|1>");
+                println!("  audio-query-rs --set-capture-source <Mic|Internal Mic>");
+                println!("  audio-query-rs --set-boost <Control> <0-3>");
                 return;
             }
             _ => {}
@@ -90,6 +107,24 @@ fn main() {
                 match mixer.set_auto_mute_mode(enable) {
                     Ok(_) => println!("{{\"status\":\"ok\",\"set_auto_mute\":{}}}", enable),
                     Err(e) => eprintln!("{{\"status\":\"error\",\"code\":{}}}", e),
+                }
+            }
+        }
+        "set-capture-source" => {
+            if let Ok(mixer) = audio_query::alsa::MixerHandle::open(card) {
+                match mixer.set_capture_source(target_val) {
+                    Ok(_) => println!("{{\"status\":\"ok\",\"set_capture_source\":\"{}\"}}", target_val),
+                    Err(e) => eprintln!("{{\"status\":\"error\",\"code\":{}}}", e),
+                }
+            }
+        }
+        "set-boost" => {
+            if let Ok(raw_val) = target_val.parse::<i32>() {
+                if let Ok(mixer) = audio_query::alsa::MixerHandle::open(card) {
+                    match mixer.set_raw_volume(target_name, raw_val) {
+                        Ok(_) => println!("{{\"status\":\"ok\",\"set_boost\":\"{}\",\"val\":{}}}", target_name, raw_val),
+                        Err(e) => eprintln!("{{\"status\":\"error\",\"code\":{}}}", e),
+                    }
                 }
             }
         }
