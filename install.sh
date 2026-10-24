@@ -94,7 +94,7 @@ chmod +x "${BIN_DIR}/audio-watchdog-rs"
 
 # Initialize settings.json if not present
 if [ ! -f "${INSTALL_DIR}/settings.json" ]; then
-    echo '{"simultaneous_output": false, "smart_mic_auto_switch": true}' > "${INSTALL_DIR}/settings.json"
+    echo '{"simultaneous_output": false, "smart_mic_auto_switch": false}' > "${INSTALL_DIR}/settings.json"
 fi
 
 echo -e "${GREEN}  ✓ Binaries and backend installed to ${INSTALL_DIR} and ${BIN_DIR}.${NC}"

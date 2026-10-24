@@ -940,7 +940,7 @@ context.modules = [
         """Load user audio preferences from settings.json."""
         defaults = {
             "simultaneous_output": False,
-            "smart_mic_auto_switch": True,
+            "smart_mic_auto_switch": False,
         }
         if os.path.exists(APP_SETTINGS_FILE):
             try:
@@ -974,16 +974,21 @@ context.modules = [
         return ok
 
     def get_smart_mic_auto_switch(self) -> bool:
-        """Check whether Smart Microphone Auto-Switch on 3.5mm jack plug/unplug is enabled (default True)."""
-        return bool(self.load_settings().get("smart_mic_auto_switch", True))
+        """
+        Check whether Smart Microphone Auto-Switch on 3.5mm jack plug/unplug is enabled.
+        Defaults to False on Linux for MacBook Cirrus Logic CS4208: Apple's proprietary TRRS
+        multiplexer hardware is unsupported by mainline Linux kernel drivers, leaving the 3.5mm mic
+        line unswitched/open-circuit. Keeping this disabled ensures calls (Zoom, WhatsApp, Meet) continue
+        using the crisp, working Built-in Digital Microphone (Pin 0x1c) while headphones are plugged in.
+        """
+        return bool(self.load_settings().get("smart_mic_auto_switch", False))
 
     def set_smart_mic_auto_switch(self, enabled: bool) -> bool:
         """Toggle smart microphone auto-switching and immediately apply routing."""
         st = self.load_settings()
         st["smart_mic_auto_switch"] = bool(enabled)
         ok = self.save_settings(st)
-        if enabled:
-            self.apply_audio_routing()
+        self.apply_audio_routing()
         return ok
 
     def get_headphone_jack_state(self, card_num: str = "1") -> bool:
@@ -1019,6 +1024,10 @@ context.modules = [
         if smart_mic:
             target_mic = "Mic" if jack_plugged else "Internal Mic"
             _, m_msg = self.set_capture_source(target_mic, card_num=card_num, adjust_gain=True)
+            mic_msg = f" | {m_msg}"
+        else:
+            # Maintain the working Internal Digital Mic so voice input works in Zoom/WhatsApp while listening via headphones
+            _, m_msg = self.set_capture_source("Internal Mic", card_num=card_num, adjust_gain=True)
             mic_msg = f" | {m_msg}"
 
         if simultaneous:
@@ -2162,18 +2171,32 @@ class MainWindow(QMainWindow):
         src_row.addWidget(src_lbl)
 
         self.combo_mic_source = QComboBox()
-        self.combo_mic_source.addItem("🎧 3.5mm Headset Microphone (External Jack - Pin 0x18)", "Mic")
-        self.combo_mic_source.addItem("💻 Built-in Digital Microphone (Internal - Pin 0x1c)", "Internal Mic")
+        self.combo_mic_source.addItem("💻 Built-in Digital Microphone (Internal - Pin 0x1c) [Recommended]", "Internal Mic")
+        self.combo_mic_source.addItem("🎧 3.5mm Headset Microphone (External Jack - Pin 0x18) [Unsupported on Linux]", "Mic")
         self.combo_mic_source.currentIndexChanged.connect(self._on_mic_source_changed)
         src_row.addWidget(self.combo_mic_source, stretch=1)
         mf_layout.addLayout(src_row)
 
-        # Smart Mic Auto-Switch checkbox
-        self.chk_smart_mic_switch = QCheckBox("🔀 Smart Mic Auto-Switch (Auto-select 3.5mm Headset Mic when headphones plugged in)")
+        # Smart Mic Auto-Switch checkbox (Default False to preserve working Built-in Mic)
+        self.chk_smart_mic_switch = QCheckBox("🔀 Auto-Switch to 3.5mm Headset Mic on Aux Plug (Experimental)")
+        self.chk_smart_mic_switch.setToolTip(
+            "Disabled by default: Apple's CS4208 3.5mm TRRS multiplexer is unsupported in Linux kernel,\n"
+            "leaving the 3.5mm mic line disconnected. Keeping this OFF ensures your Built-in Microphone\n"
+            "continues working in Zoom, WhatsApp, and calls when headphones are plugged in."
+        )
         self.chk_smart_mic_switch.setStyleSheet("font-size: 12px; font-weight: bold; color: #06d6a0;")
-        self.chk_smart_mic_switch.setChecked(True)
+        self.chk_smart_mic_switch.setChecked(self.backend.get_smart_mic_auto_switch())
         self.chk_smart_mic_switch.toggled.connect(self._on_smart_mic_switch_toggled)
         mf_layout.addWidget(self.chk_smart_mic_switch)
+
+        mic_notice = QLabel(
+            "ℹ️ <b>Headphone Aux Mic note:</b> Apple's 3.5mm TRRS combo jack uses a proprietary analog switch "
+            "that is unsupported by Linux kernel drivers. When using aux headphones, this app keeps the Built-in "
+            "Microphone active so Zoom/WhatsApp calls work seamlessly. For an external mic, use a USB adapter."
+        )
+        mic_notice.setWordWrap(True)
+        mic_notice.setStyleSheet("font-size: 11px; color: #7aa2f7; padding: 3px 0 6px 0;")
+        mf_layout.addWidget(mic_notice)
 
         # Capture Volume & Switch row
         cap_row = QHBoxLayout()
@@ -2493,7 +2516,7 @@ class MainWindow(QMainWindow):
 
         if hasattr(self, "lbl_mic_overview"):
             cap_src = alsa_stat.get("capture_source", "Internal Mic")
-            smart_mic = alsa_stat.get("smart_mic_auto_switch", True)
+            smart_mic = alsa_stat.get("smart_mic_auto_switch", False)
             mode_tag = " [Auto-Switch ON]" if smart_mic else " [Manual]"
             if cap_src == "Mic":
                 self.lbl_mic_overview.setText(f"Active Microphone: 3.5mm Headset Mic (Pin 0x18) 🎙️{mode_tag}")
@@ -2731,7 +2754,7 @@ class MainWindow(QMainWindow):
             # Microphone & 3.5mm Headset Input controls
             headset_avail = alsa.get("headset_mic_available", False)
             cap_src = alsa.get("capture_source", "Internal Mic")
-            smart_mic = alsa.get("smart_mic_auto_switch", True)
+            smart_mic = alsa.get("smart_mic_auto_switch", False)
             cap_sw = alsa.get("capture_switch", True)
             cap_vol = alsa.get("capture_volume", 100)
             mic_boost = alsa.get("mic_boost", 3)
@@ -2747,12 +2770,14 @@ class MainWindow(QMainWindow):
 
             if hasattr(self, "combo_mic_source"):
                 self.combo_mic_source.blockSignals(True)
-                self.combo_mic_source.setCurrentIndex(0 if cap_src == "Mic" else 1)
+                idx = self.combo_mic_source.findData(cap_src)
+                if idx >= 0:
+                    self.combo_mic_source.setCurrentIndex(idx)
                 self.combo_mic_source.blockSignals(False)
 
             if hasattr(self, "chk_smart_mic_switch"):
                 self.chk_smart_mic_switch.blockSignals(True)
-                self.chk_smart_mic_switch.setChecked(smart_mic)
+                self.chk_smart_mic_switch.setChecked(self.backend.get_smart_mic_auto_switch())
                 self.chk_smart_mic_switch.blockSignals(False)
 
             if hasattr(self, "btn_capture_switch"):

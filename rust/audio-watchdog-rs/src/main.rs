@@ -160,15 +160,15 @@ fn read_simultaneous_setting(settings_file: &PathBuf) -> bool {
     false
 }
 
-/// Read whether smart microphone auto-switch on headphone jack plug/unplug is enabled in settings.json (default true)
+/// Read whether smart microphone auto-switch on headphone jack plug/unplug is enabled in settings.json (default false on CS4208 to preserve working Internal Mic)
 fn read_smart_mic_setting(settings_file: &PathBuf) -> bool {
     if let Ok(content) = fs::read_to_string(settings_file) {
         let lower = content.to_lowercase();
-        if lower.contains("\"smart_mic_auto_switch\": false") || lower.contains("\"smart_mic_auto_switch\":false") {
-            return false;
+        if lower.contains("\"smart_mic_auto_switch\": true") || lower.contains("\"smart_mic_auto_switch\":true") {
+            return true;
         }
     }
-    true
+    false
 }
 
 fn main() {
@@ -222,6 +222,8 @@ fn main() {
                 let jack = query_headphone_jack_state();
                 if smart_mic {
                     route_microphone_input(jack);
+                } else {
+                    route_microphone_input(false);
                 }
                 let cap_src = query_capture_source();
                 if simultaneous {
@@ -276,6 +278,8 @@ fn run_daemon(pid_file: &PathBuf, status_file: &PathBuf, log_file: &PathBuf, set
     let initial_smart_mic = read_smart_mic_setting(settings_file);
     if initial_smart_mic {
         route_microphone_input(initial_jack);
+    } else {
+        route_microphone_input(false);
     }
     let initial_cap_src = query_capture_source();
 
@@ -333,9 +337,11 @@ fn run_daemon(pid_file: &PathBuf, status_file: &PathBuf, log_file: &PathBuf, set
                     }
                 }
 
-                // Route microphone automatically if smart_mic_auto_switch is enabled
+                // Route microphone automatically if smart_mic_auto_switch is enabled, otherwise maintain working Built-in mic
                 if smart_mic {
                     route_microphone_input(jack_state);
+                } else {
+                    route_microphone_input(false);
                 }
 
                 let cap_src = query_capture_source();
