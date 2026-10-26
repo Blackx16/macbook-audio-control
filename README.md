@@ -49,7 +49,7 @@ When running modern Linux (CachyOS, Arch, Fedora, Ubuntu) on Apple MacBooks:
    - *High-Fidelity Bluetooth A2DP*: LDAC HQ (990k) and SBC-XQ optimized.
 2. **⏱️ Buffer Size, Bitrate & Clock**: Live quantum selection (32 to 4096) and sample rates (44.1k to 192k) with uncompressed PCM bitrate monitoring.
 3. **🎛️ Audio Profiles**: Seamless switching between Pro Audio, Analog Stereo Duplex, and custom profiles.
-4. **🔊 Hardware & Devices**: ALSA hardware master volume, speaker volume, headphone volume, smart jack routing status, and simultaneous multi-output toggle.
+4. **🔊 Hardware & Devices**: ALSA hardware master volume, speaker volume, headphone volume, smart jack routing status, simultaneous multi-output toggle, **AudioRelay Virtual Microphone pipeline** (phone as PC mic), and **PipeWire Input Sources / Microphones manager**.
 5. **📶 Bluetooth Audio Hub**: Real-time connected device manager and LDAC / SBC-XQ high-bitrate rules.
 6. **🔍 Diagnostics & Logs**: Live system diagnostics, XRUN counters, and PipeWire journal inspector.
 
@@ -138,6 +138,17 @@ macbook-audio-control --simultaneous on
 macbook-audio-control --mic headset
 macbook-audio-control --mic internal
 macbook-audio-control --mic auto
+macbook-audio-control --mic virtual
+
+# Virtual Microphone & AudioRelay Support (Phone as PC Mic)
+macbook-audio-control --setup-virtual-mic       # Permanent (auto-starts on boot)
+macbook-audio-control --setup-virtual-mic --temp # Temporary (current session only)
+macbook-audio-control --virtual-mic-status      # Check virtual mic status
+macbook-audio-control --remove-virtual-mic      # Unload and disable virtual mic
+
+# Manage audio input sources (microphones)
+macbook-audio-control --sources                 # List all microphones & volume
+macbook-audio-control --set-source <id_or_name> # Set default system microphone
 ```
 
 ### Interacting with the Background Watchdog (`audio-watchdog-rs`):

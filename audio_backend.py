@@ -15,9 +15,11 @@ from typing import Dict, List, Optional, Tuple, Any
 
 # Configuration paths
 PIPEWIRE_CONF_DIR = os.path.expanduser("~/.config/pipewire/pipewire.conf.d")
+PIPEWIRE_PULSE_CONF_DIR = os.path.expanduser("~/.config/pipewire/pipewire-pulse.conf.d")
 WIREPLUMBER_CONF_DIR = os.path.expanduser("~/.config/wireplumber/wireplumber.conf.d")
 
 PIPEWIRE_QUANTUM_CONF = os.path.join(PIPEWIRE_CONF_DIR, "10-quantum.conf")
+PIPEWIRE_VMIC_CONF = os.path.join(PIPEWIRE_PULSE_CONF_DIR, "20-audiorelay-virtual-mic.conf")
 WIREPLUMBER_PRO_CONF = os.path.join(WIREPLUMBER_CONF_DIR, "51-pro-audio-fix.conf")
 WIREPLUMBER_BT_CONF = os.path.join(WIREPLUMBER_CONF_DIR, "52-bluez-bitrate.conf")
 APP_SETTINGS_FILE = os.path.expanduser("~/.local/share/macbook-audio-control/settings.json")
@@ -62,6 +64,7 @@ class AudioBackend:
 
     def __init__(self):
         os.makedirs(PIPEWIRE_CONF_DIR, exist_ok=True)
+        os.makedirs(PIPEWIRE_PULSE_CONF_DIR, exist_ok=True)
         os.makedirs(WIREPLUMBER_CONF_DIR, exist_ok=True)
 
     # -------------------------------------------------------------------------
@@ -614,12 +617,258 @@ context.modules = [
             return True, f"Default output set to ID {sink_id}"
         return False, f"Failed to set default sink: {err or out}"
 
-    def set_default_source(self, source_id: int) -> Tuple[bool, str]:
-        """Set default audio input source."""
-        code, out, err = run_cmd(["wpctl", "set-default", str(source_id)])
+    def set_default_source(self, source_id_or_name: Any) -> Tuple[bool, str]:
+        """Set default audio input source (supports ID or node name)."""
+        # Try pactl set-default-source
+        code, out, err = run_cmd(["pactl", "set-default-source", str(source_id_or_name)])
         if code == 0:
-            return True, f"Default input set to ID {source_id}"
-        return False, f"Failed to set default source: {err or out}"
+            return True, f"Default microphone set to {source_id_or_name}"
+        # Fallback to wpctl set-default
+        code_wp, out_wp, err_wp = run_cmd(["wpctl", "set-default", str(source_id_or_name)])
+        if code_wp == 0:
+            return True, f"Default microphone set to ID {source_id_or_name} via wpctl"
+        return False, f"Failed to set default microphone: {err or err_wp}"
+
+    def get_audio_sources(self, include_monitors: bool = False) -> List[Dict[str, Any]]:
+        """
+        Query all audio input sources (microphones) via pactl.
+        Includes physical microphones, virtual microphones (AudioRelay), and Bluetooth inputs.
+        """
+        code, stdout, _ = run_cmd(["pactl", "list", "sources"])
+        if code != 0 or not stdout:
+            st = self.get_wpctl_status()
+            return st.get("sources", [])
+
+        code_def, stdout_def, _ = run_cmd(["pactl", "info"])
+        def_source = ""
+        if code_def == 0 and stdout_def:
+            for l in stdout_def.splitlines():
+                if l.startswith("Default Source:"):
+                    def_source = l.split(":", 1)[1].strip()
+
+        sources = []
+        curr: Dict[str, Any] = {}
+        for line in stdout.splitlines():
+            m_id = re.match(r"^Source #(\d+)", line)
+            if m_id:
+                if curr:
+                    sources.append(curr)
+                curr = {
+                    "id": int(m_id.group(1)),
+                    "name": "",
+                    "description": "",
+                    "volume": 1.0,
+                    "muted": False,
+                    "is_monitor": False,
+                }
+                continue
+            if not curr:
+                continue
+            m_name = re.match(r"^\s+Name:\s*(.+)$", line)
+            if m_name:
+                curr["name"] = m_name.group(1).strip()
+            m_desc = re.match(r"^\s+Description:\s*(.+)$", line)
+            if m_desc:
+                curr["description"] = m_desc.group(1).strip()
+            m_mute = re.match(r"^\s+Mute:\s*(yes|no)", line)
+            if m_mute:
+                curr["muted"] = (m_mute.group(1) == "yes")
+            m_vol = re.search(r"Volume:.*?(\d+)%", line)
+            if m_vol:
+                curr["volume"] = int(m_vol.group(1)) / 100.0
+            m_mon = re.match(r"^\s+Monitor of Sink:\s*(.+)$", line)
+            if m_mon and m_mon.group(1).strip() != "n/a":
+                curr["is_monitor"] = True
+
+        if curr:
+            sources.append(curr)
+
+        filtered = []
+        for s in sources:
+            if not include_monitors and s.get("is_monitor"):
+                continue
+            s_name = s.get("name", "")
+            s_desc = s.get("description", "")
+            s["is_default"] = (
+                s_name == def_source or 
+                s_name == def_source.replace(".monitor", "") or
+                str(s["id"]) == def_source
+            )
+            s["is_virtual"] = ("audiorelay" in s_name.lower() or "virtual" in s_desc.lower())
+            filtered.append(s)
+
+        return filtered
+
+    def set_source_volume(self, source_id: int, volume: float) -> Tuple[bool, str]:
+        """Set source/microphone volume (0.0 - 1.5)."""
+        pct = int(max(0.0, min(1.5, volume)) * 100)
+        code, out, err = run_cmd(["pactl", "set-source-volume", str(source_id), f"{pct}%"])
+        if code == 0:
+            return True, f"Microphone {source_id} volume set to {pct}%"
+        return self.set_volume(source_id, volume)
+
+    def set_source_mute(self, source_id: int, mute: bool) -> Tuple[bool, str]:
+        """Set source/microphone mute state."""
+        val = "1" if mute else "0"
+        code, out, err = run_cmd(["pactl", "set-source-mute", str(source_id), val])
+        if code == 0:
+            return True, f"Microphone {source_id} {'muted' if mute else 'unmuted'}"
+        return self.set_mute(source_id, mute)
+
+    def get_virtual_mic_status(self) -> Dict[str, Any]:
+        """
+        Check whether the AudioRelay virtual microphone is configured and active.
+        """
+        permanent = os.path.exists(PIPEWIRE_VMIC_CONF)
+        code_sinks, sinks_out, _ = run_cmd(["pactl", "list", "sinks", "short"])
+        code_sources, sources_out, _ = run_cmd(["pactl", "list", "sources", "short"])
+
+        sink_active = (code_sinks == 0 and "audiorelay-virtual-mic-sink" in sinks_out)
+        source_active = (code_sources == 0 and "audiorelay-virtual-mic-sink" in sources_out)
+
+        sink_id = None
+        source_id = None
+        if sink_active:
+            for l in sinks_out.splitlines():
+                if "audiorelay-virtual-mic-sink" in l:
+                    parts = l.split()
+                    if parts:
+                        try:
+                            sink_id = int(parts[0])
+                        except ValueError:
+                            pass
+        if source_active:
+            for l in sources_out.splitlines():
+                if "audiorelay-virtual-mic-sink" in l and ".monitor" not in l:
+                    parts = l.split()
+                    if parts:
+                        try:
+                            source_id = int(parts[0])
+                        except ValueError:
+                            pass
+
+        is_def = False
+        code_def, stdout_def, _ = run_cmd(["pactl", "info"])
+        if code_def == 0 and stdout_def:
+            for l in stdout_def.splitlines():
+                if l.startswith("Default Source:"):
+                    def_src = l.split(":", 1)[1].strip()
+                    if "audiorelay-virtual-mic-sink" in def_src:
+                        is_def = True
+
+        return {
+            "active": bool(sink_active and source_active),
+            "sink_active": bool(sink_active),
+            "source_active": bool(source_active),
+            "sink_name": "audiorelay-virtual-mic-sink",
+            "sink_desc": "Virtual-Mic-Sink",
+            "source_name": "audiorelay-virtual-mic-sink",
+            "source_desc": "Virtual-Mic",
+            "permanent": permanent,
+            "sink_id": sink_id,
+            "source_id": source_id,
+            "is_default_source": is_def,
+        }
+
+    def setup_virtual_mic(self, permanent: bool = True) -> Tuple[bool, str]:
+        """
+        Configure AudioRelay Virtual Microphone pipeline:
+        1. audiorelay-virtual-mic-sink (Virtual-Mic-Sink): where AudioRelay streams audio into
+        2. audiorelay-virtual-mic-sink (Virtual-Mic): virtual source for apps (Discord, Zoom, etc.)
+        If permanent=True, writes drop-in config to pipewire-pulse.conf.d so it persists across reboots.
+        """
+        stat = self.get_virtual_mic_status()
+        logs = []
+
+        if permanent:
+            os.makedirs(PIPEWIRE_PULSE_CONF_DIR, exist_ok=True)
+            conf_content = (
+                "# Generated by MacBook Audio Control Center for AudioRelay Virtual Mic\n"
+                "pulse.cmd = [\n"
+                "    { cmd = \"load-module\" args = \"module-null-sink sink_name=audiorelay-virtual-mic-sink sink_properties=device.description=Virtual-Mic-Sink\" }\n"
+                "    { cmd = \"load-module\" args = \"module-remap-source master=audiorelay-virtual-mic-sink.monitor source_name=audiorelay-virtual-mic-sink source_properties=device.description=Virtual-Mic\" }\n"
+                "]\n"
+            )
+            with open(PIPEWIRE_VMIC_CONF, "w", encoding="utf-8") as f:
+                f.write(conf_content)
+            logs.append(f"Permanent config written to {PIPEWIRE_VMIC_CONF}")
+
+        # If not active, load live modules immediately
+        if not (stat.get("sink_active") and stat.get("source_active")):
+            c1, out1, err1 = run_cmd([
+                "pactl", "load-module", "module-null-sink",
+                "sink_name=audiorelay-virtual-mic-sink",
+                "sink_properties=device.description=Virtual-Mic-Sink"
+            ])
+            c2, out2, err2 = run_cmd([
+                "pactl", "load-module", "module-remap-source",
+                "master=audiorelay-virtual-mic-sink.monitor",
+                "source_name=audiorelay-virtual-mic-sink",
+                "source_properties=device.description=Virtual-Mic"
+            ])
+            if c1 == 0 and c2 == 0:
+                logs.append("Live PipeWire virtual mic sink and source loaded successfully.")
+            else:
+                if permanent:
+                    run_cmd(["systemctl", "--user", "restart", "pipewire-pulse"])
+                    logs.append("Restarted pipewire-pulse to load virtual microphone configuration.")
+                else:
+                    return False, f"Failed to load virtual microphone: {err1 or err2}"
+
+        # Persist preference in settings.json
+        settings = self.load_settings()
+        settings["virtual_mic_enabled"] = True
+        settings["virtual_mic_permanent"] = permanent
+        self.save_settings(settings)
+
+        logs.append("Virtual-Mic-Sink (audio target) and Virtual-Mic (microphone source) are active.")
+        return True, " | ".join(logs)
+
+    def remove_virtual_mic(self) -> Tuple[bool, str]:
+        """
+        Disable and remove AudioRelay Virtual Microphone pipeline.
+        Removes permanent drop-in config and unloads live modules.
+        """
+        logs = []
+        if os.path.exists(PIPEWIRE_VMIC_CONF):
+            try:
+                os.remove(PIPEWIRE_VMIC_CONF)
+                logs.append("Removed persistent configuration file.")
+            except Exception as e:
+                logs.append(f"Warning: could not remove config file: {e}")
+
+        # Find module IDs and unload them
+        code, out, _ = run_cmd(["pactl", "list", "modules", "short"])
+        unloaded = 0
+        if code == 0 and out:
+            for line in out.splitlines():
+                if "audiorelay-virtual-mic-sink" in line:
+                    parts = line.split()
+                    if parts:
+                        mod_id = parts[0]
+                        c_u, _, _ = run_cmd(["pactl", "unload-module", mod_id])
+                        if c_u == 0:
+                            unloaded += 1
+
+        if unloaded > 0:
+            logs.append(f"Unloaded {unloaded} virtual mic module(s).")
+        else:
+            run_cmd(["systemctl", "--user", "restart", "pipewire-pulse"])
+            logs.append("Cleaned up virtual audio devices via pipewire-pulse refresh.")
+
+        # If default source was virtual mic, reset to built-in audio
+        sources = self.get_audio_sources(include_monitors=False)
+        for src in sources:
+            if not src.get("is_virtual"):
+                self.set_default_source(src["id"])
+                break
+
+        settings = self.load_settings()
+        settings["virtual_mic_enabled"] = False
+        settings.pop("virtual_mic_permanent", None)
+        self.save_settings(settings)
+
+        return True, " | ".join(logs) if logs else "Virtual microphone removed."
 
     def set_volume(self, node_id: int, volume: float) -> Tuple[bool, str]:
         """Set volume (0.0 - 1.5)."""
@@ -1639,8 +1888,9 @@ class MainWindow(QMainWindow):
         self.slider_timer = QTimer(self)
         self.slider_timer.setSingleShot(True)
 
-        # Cache of existing sink rows to prevent recreate stutter
+        # Cache of existing sink and source rows to prevent recreate stutter
         self.sink_widgets: Dict[int, Dict[str, Any]] = {}
+        self.source_widgets: Dict[int, Dict[str, Any]] = {}
 
         # Real-time jack sensing polling timer (every 1 second)
         self.jack_timer = QTimer(self)
@@ -2012,9 +2262,17 @@ class MainWindow(QMainWindow):
     # TAB 4: HARDWARE & SINK DEVICES
     # -------------------------------------------------------------------------
     def _create_tab_hardware(self) -> QWidget:
+        outer_scroll = QScrollArea()
+        outer_scroll.setWidgetResizable(True)
+        outer_scroll.setFrameShape(QFrame.NoFrame)
+        outer_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+
         widget = QWidget()
+        widget.setStyleSheet("background: transparent;")
         layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 8, 0)
         layout.setSpacing(14)
+        outer_scroll.setWidget(widget)
 
         # Cirrus Logic CS4208 Hardware Controls
         alsa_group = QGroupBox("MacBook Broadwell-U Hardware ALSA Controls (Cirrus Logic CS4208)")
@@ -2288,18 +2546,113 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(hdmi_group)
 
+        # Virtual Microphone & AudioRelay Support GroupBox
+        vmic_group = QGroupBox("📱 Virtual Microphone & AudioRelay Support (Phone as PC Mic)")
+        vg_layout = QVBoxLayout(vmic_group)
+        vg_layout.setSpacing(8)
+
+        vmic_header = QHBoxLayout()
+        vmic_title = QLabel("<b>AudioRelay Virtual Microphone Pipeline:</b>")
+        self.lbl_vmic_badge = QLabel("⚪ Inactive")
+        self.lbl_vmic_badge.setStyleSheet("background-color: #414868; color: #c0caf5; font-weight: bold; border-radius: 4px; padding: 3px 8px; font-size: 11px;")
+        vmic_header.addWidget(vmic_title)
+        vmic_header.addWidget(self.lbl_vmic_badge)
+        vmic_header.addStretch()
+        vg_layout.addLayout(vmic_header)
+
+        vmic_desc = QLabel(
+            "Creates a virtual audio pipeline for AudioRelay (https://audiorelay.net) or any audio streaming tool "
+            "to stream your phone's microphone to this MacBook for use in Discord, Zoom, Meet, WhatsApp, or games."
+        )
+        vmic_desc.setWordWrap(True)
+        vmic_desc.setStyleSheet("color: #a9b1d6; font-size: 12px;")
+        vg_layout.addWidget(vmic_desc)
+
+        # Buttons row
+        btn_vmic_row = QHBoxLayout()
+        self.btn_vmic_enable_perm = QPushButton("✨ Enable Virtual Mic (Permanent / Boot)")
+        self.btn_vmic_enable_perm.setStyleSheet("background-color: #7aa2f7; color: #15161e; font-weight: bold; padding: 8px 14px;")
+        self.btn_vmic_enable_perm.clicked.connect(self._enable_vmic_permanent)
+        btn_vmic_row.addWidget(self.btn_vmic_enable_perm)
+
+        self.btn_vmic_enable_temp = QPushButton("⚡ Enable (Temporary)")
+        self.btn_vmic_enable_temp.setStyleSheet("background-color: #24283b; color: #7aa2f7; font-weight: bold; padding: 8px 14px;")
+        self.btn_vmic_enable_temp.clicked.connect(self._enable_vmic_temporary)
+        btn_vmic_row.addWidget(self.btn_vmic_enable_temp)
+
+        self.btn_vmic_set_default = QPushButton("🎯 Set as Default Microphone")
+        self.btn_vmic_set_default.setEnabled(False)
+        self.btn_vmic_set_default.setStyleSheet("background-color: #24283b; color: #a9b1d6; font-weight: bold; padding: 8px 14px;")
+        self.btn_vmic_set_default.clicked.connect(self._set_vmic_default_callback)
+        btn_vmic_row.addWidget(self.btn_vmic_set_default)
+
+        self.btn_vmic_remove = QPushButton("🗑️ Remove Virtual Mic")
+        self.btn_vmic_remove.setEnabled(False)
+        self.btn_vmic_remove.setStyleSheet("background-color: #f7768e; color: #15161e; font-weight: bold; padding: 8px 14px;")
+        self.btn_vmic_remove.clicked.connect(self._remove_vmic_callback)
+        btn_vmic_row.addWidget(self.btn_vmic_remove)
+
+        btn_vmic_row.addStretch()
+        vg_layout.addLayout(btn_vmic_row)
+
+        # Guide box
+        guide_frame = QFrame()
+        guide_frame.setStyleSheet("""
+            QFrame {
+                background-color: #1a1b26;
+                border: 1px solid #414868;
+                border-radius: 6px;
+                padding: 8px;
+            }
+        """)
+        g_layout = QVBoxLayout(guide_frame)
+        g_layout.setContentsMargins(8, 6, 8, 6)
+        guide_text = QLabel(
+            "📖 <b>How to Use with AudioRelay:</b><br>"
+            "1. <b>On Phone:</b> Open AudioRelay &rarr; Go to <b>Server</b> tab &rarr; Tap <b>Microphone</b>.<br>"
+            "2. <b>On PC:</b> Open AudioRelay &rarr; Go to <b>Player</b> tab &rarr; Choose <b>Virtual-Mic-Sink</b>.<br>"
+            "3. <b>In Apps:</b> Select <b>Virtual-Mic</b> in Discord, Zoom, Meet, or click 'Set as Default Microphone' above!"
+        )
+        guide_text.setTextFormat(Qt.RichText)
+        guide_text.setStyleSheet("color: #787c99; font-size: 11px;")
+        g_layout.addWidget(guide_text)
+        vg_layout.addWidget(guide_frame)
+
+        layout.addWidget(vmic_group)
+
+        # Active Audio Input Devices (PipeWire Microphones & Sources)
+        sources_group = QGroupBox("Active Audio Input Devices (PipeWire Microphones & Sources)")
+        srg_layout = QVBoxLayout(sources_group)
+        self.sources_scroll = QScrollArea()
+        self.sources_scroll.setWidgetResizable(True)
+        self.sources_scroll.setMinimumHeight(140)
+        self.sources_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        self.sources_container = QWidget()
+        self.sources_container.setStyleSheet("background: transparent;")
+        self.sources_layout = QVBoxLayout(self.sources_container)
+        self.sources_layout.setContentsMargins(0, 0, 0, 0)
+        self.sources_layout.setSpacing(6)
+        self.sources_scroll.setWidget(self.sources_container)
+        srg_layout.addWidget(self.sources_scroll)
+        layout.addWidget(sources_group)
+
         # PipeWire Sinks list
         sinks_group = QGroupBox("Active Audio Output Devices (PipeWire Sinks)")
         sg_layout = QVBoxLayout(sinks_group)
         self.sinks_scroll = QScrollArea()
         self.sinks_scroll.setWidgetResizable(True)
+        self.sinks_scroll.setMinimumHeight(140)
+        self.sinks_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         self.sinks_container = QWidget()
+        self.sinks_container.setStyleSheet("background: transparent;")
         self.sinks_layout = QVBoxLayout(self.sinks_container)
+        self.sinks_layout.setContentsMargins(0, 0, 0, 0)
+        self.sinks_layout.setSpacing(6)
         self.sinks_scroll.setWidget(self.sinks_container)
         sg_layout.addWidget(self.sinks_scroll)
-        layout.addWidget(sinks_group, stretch=1)
+        layout.addWidget(sinks_group)
 
-        return widget
+        return outer_scroll
 
     # -------------------------------------------------------------------------
     # TAB 5: BLUETOOTH AUDIO HUB
@@ -2770,9 +3123,23 @@ class MainWindow(QMainWindow):
 
             if hasattr(self, "combo_mic_source"):
                 self.combo_mic_source.blockSignals(True)
-                idx = self.combo_mic_source.findData(cap_src)
-                if idx >= 0:
-                    self.combo_mic_source.setCurrentIndex(idx)
+                vstat = self.backend.get_virtual_mic_status()
+                vmic_idx = self.combo_mic_source.findData("Virtual-Mic")
+                if vstat.get("active"):
+                    if vmic_idx < 0:
+                        self.combo_mic_source.addItem("📱 AudioRelay Virtual Mic (Phone Input) [Active]", "Virtual-Mic")
+                else:
+                    if vmic_idx >= 0:
+                        self.combo_mic_source.removeItem(vmic_idx)
+
+                if vstat.get("is_default_source"):
+                    cur_v_idx = self.combo_mic_source.findData("Virtual-Mic")
+                    if cur_v_idx >= 0:
+                        self.combo_mic_source.setCurrentIndex(cur_v_idx)
+                else:
+                    idx = self.combo_mic_source.findData(cap_src)
+                    if idx >= 0:
+                        self.combo_mic_source.setCurrentIndex(idx)
                 self.combo_mic_source.blockSignals(False)
 
             if hasattr(self, "chk_smart_mic_switch"):
@@ -2902,6 +3269,117 @@ class MainWindow(QMainWindow):
             w = self.sink_widgets.pop(sid)
             w["widget"].deleteLater()
 
+        # PipeWire Sources (Audio Input Devices / Microphones)
+        if hasattr(self, "sources_layout"):
+            sources = self.backend.get_audio_sources(include_monitors=False)
+            current_source_ids = set()
+
+            for s in sources:
+                sid = s["id"]
+                current_source_ids.add(sid)
+                if sid not in self.source_widgets:
+                    row = QFrame()
+                    row.setStyleSheet("""
+                        QFrame {
+                            background-color: #24283b;
+                            border: 1px solid #414868;
+                            border-radius: 6px;
+                            padding: 8px;
+                        }
+                    """)
+                    rl = QHBoxLayout(row)
+                    rl.setContentsMargins(8, 4, 8, 4)
+
+                    icon = "📱" if s.get("is_virtual") else "💻"
+                    name_lbl = QLabel(f"<b>{icon} {s['id']}. {s['description'] or s['name']}</b>")
+                    rl.addWidget(name_lbl)
+
+                    def_btn = QPushButton("Set Default Mic")
+                    def_btn.clicked.connect(lambda _, target_id=sid: self._set_default_source_callback(target_id))
+                    rl.addWidget(def_btn)
+
+                    def_badge = QLabel("⭐ DEFAULT MIC")
+                    def_badge.setStyleSheet("background-color: #06d6a0; color: #15161e; font-weight: bold; border-radius: 4px; padding: 2px 6px; font-size: 11px;")
+                    rl.addWidget(def_badge)
+
+                    rl.addStretch()
+
+                    vol_slider = QSlider(Qt.Horizontal)
+                    vol_slider.setRange(0, 150)
+                    vol_slider.setValue(int(s["volume"] * 100))
+                    vol_slider.setFixedWidth(160)
+                    vol_lbl = QLabel(f"{int(s['volume'] * 100)}%")
+                    vol_lbl.setFixedWidth(45)
+
+                    vol_slider.valueChanged.connect(lambda val, target_id=sid, vlbl=vol_lbl: self._on_source_slider_moved(target_id, val, vlbl))
+                    rl.addWidget(vol_slider)
+                    rl.addWidget(vol_lbl)
+
+                    mute_btn = QPushButton("Muted" if s.get("muted") else "Mute")
+                    mute_btn.setCheckable(True)
+                    mute_btn.setChecked(s.get("muted", False))
+                    mute_btn.clicked.connect(lambda _, target_id=sid, mbtn=mute_btn: self._toggle_source_mute(target_id, mbtn))
+                    rl.addWidget(mute_btn)
+
+                    self.sources_layout.addWidget(row)
+                    self.source_widgets[sid] = {
+                        "widget": row,
+                        "name_lbl": name_lbl,
+                        "def_btn": def_btn,
+                        "def_badge": def_badge,
+                        "vol_slider": vol_slider,
+                        "vol_lbl": vol_lbl,
+                        "mute_btn": mute_btn,
+                    }
+
+                # Update state of existing row
+                entry = self.source_widgets[sid]
+                icon = "📱" if s.get("is_virtual") else "💻"
+                entry["name_lbl"].setText(f"<b>{icon} {s['id']}. {s['description'] or s['name']}</b>")
+                entry["def_badge"].setVisible(bool(s.get("is_default")))
+                entry["def_btn"].setVisible(not bool(s.get("is_default")))
+
+                if not entry["vol_slider"].isSliderDown():
+                    entry["vol_slider"].blockSignals(True)
+                    entry["vol_slider"].setValue(int(s["volume"] * 100))
+                    entry["vol_lbl"].setText(f"{int(s['volume'] * 100)}%")
+                    entry["vol_slider"].blockSignals(False)
+
+                entry["mute_btn"].blockSignals(True)
+                entry["mute_btn"].setChecked(s.get("muted", False))
+                entry["mute_btn"].setText("Muted" if s.get("muted") else "Mute")
+                entry["mute_btn"].setStyleSheet("background-color: #f7768e; color: #15161e; font-weight: bold;" if s.get("muted") else "")
+                entry["mute_btn"].blockSignals(False)
+
+            # Remove dead source widgets
+            dead_sids = [sid for sid in self.source_widgets if sid not in current_source_ids]
+            for sid in dead_sids:
+                w = self.source_widgets.pop(sid)
+                w["widget"].deleteLater()
+
+        # Update Virtual Mic Status Card
+        if hasattr(self, "lbl_vmic_badge"):
+            vstat = self.backend.get_virtual_mic_status()
+            if vstat.get("active"):
+                mode = "Permanent (Boot)" if vstat.get("permanent") else "Temporary (Session)"
+                self.lbl_vmic_badge.setText(f"🟢 Active ({mode})")
+                self.lbl_vmic_badge.setStyleSheet("background-color: #06d6a0; color: #15161e; font-weight: bold; border-radius: 4px; padding: 3px 8px; font-size: 11px;")
+                self.btn_vmic_remove.setEnabled(True)
+                self.btn_vmic_set_default.setEnabled(True)
+                if vstat.get("is_default_source"):
+                    self.btn_vmic_set_default.setText("✓ Default Microphone")
+                    self.btn_vmic_set_default.setStyleSheet("background-color: #06d6a0; color: #15161e; font-weight: bold; padding: 8px 14px;")
+                else:
+                    self.btn_vmic_set_default.setText("🎯 Set as Default Microphone")
+                    self.btn_vmic_set_default.setStyleSheet("background-color: #7aa2f7; color: #15161e; font-weight: bold; padding: 8px 14px;")
+            else:
+                self.lbl_vmic_badge.setText("⚪ Inactive")
+                self.lbl_vmic_badge.setStyleSheet("background-color: #414868; color: #c0caf5; font-weight: bold; border-radius: 4px; padding: 3px 8px; font-size: 11px;")
+                self.btn_vmic_remove.setEnabled(False)
+                self.btn_vmic_set_default.setEnabled(False)
+                self.btn_vmic_set_default.setText("🎯 Set as Default Microphone")
+                self.btn_vmic_set_default.setStyleSheet("background-color: #24283b; color: #a9b1d6; font-weight: bold; padding: 8px 14px;")
+
     def _on_sink_slider_moved(self, sink_id: int, val: int, label: QLabel):
         label.setText(f"{val}%")
         self.slider_timer.stop()
@@ -2987,9 +3465,68 @@ class MainWindow(QMainWindow):
         self._refresh_hardware_and_sinks()
         self._refresh_header_and_overview()
 
+    def _on_source_slider_moved(self, source_id: int, val: int, label: QLabel):
+        label.setText(f"{val}%")
+        self.slider_timer.stop()
+        self.slider_timer.timeout.disconnect() if self.slider_timer.receivers(self.slider_timer.timeout) > 0 else None
+        self.slider_timer.timeout.connect(lambda: self.backend.set_source_volume(source_id, val / 100.0))
+        self.slider_timer.start(50)
+
+    def _toggle_source_mute(self, source_id: int, button: QPushButton):
+        is_muted = button.isChecked()
+        self.backend.set_source_mute(source_id, is_muted)
+        button.setText("Muted" if is_muted else "Mute")
+        button.setStyleSheet("background-color: #f7768e; color: #15161e; font-weight: bold;" if is_muted else "")
+
+    def _set_default_source_callback(self, source_id: int):
+        self.backend.set_default_source(source_id)
+        self.refresh_all()
+
+    def _enable_vmic_permanent(self):
+        ok, msg = self.backend.setup_virtual_mic(permanent=True)
+        if ok:
+            QMessageBox.information(self, "Virtual Microphone Configured", msg)
+        else:
+            QMessageBox.critical(self, "Error", msg)
+        self.refresh_all()
+
+    def _enable_vmic_temporary(self):
+        ok, msg = self.backend.setup_virtual_mic(permanent=False)
+        if ok:
+            QMessageBox.information(self, "Virtual Microphone (Temporary)", msg)
+        else:
+            QMessageBox.critical(self, "Error", msg)
+        self.refresh_all()
+
+    def _remove_vmic_callback(self):
+        ok, msg = self.backend.remove_virtual_mic()
+        if ok:
+            QMessageBox.information(self, "Virtual Microphone Removed", msg)
+        else:
+            QMessageBox.critical(self, "Error", msg)
+        self.refresh_all()
+
+    def _set_vmic_default_callback(self):
+        stat = self.backend.get_virtual_mic_status()
+        sid = stat.get("source_id") or "audiorelay-virtual-mic-sink"
+        self.backend.set_default_source(sid)
+        self.refresh_all()
+
     def _on_mic_source_changed(self, index: int):
         target_src = self.combo_mic_source.itemData(index) or "Internal Mic"
-        self.backend.set_capture_source(target_src, "1", adjust_gain=True)
+        if target_src == "Virtual-Mic":
+            stat = self.backend.get_virtual_mic_status()
+            sid = stat.get("source_id") or "audiorelay-virtual-mic-sink"
+            self.backend.set_default_source(sid)
+        else:
+            self.backend.set_capture_source(target_src, "1", adjust_gain=True)
+            stat = self.backend.get_virtual_mic_status()
+            if stat.get("is_default_source"):
+                sources = self.backend.get_audio_sources(include_monitors=False)
+                for s in sources:
+                    if not s.get("is_virtual"):
+                        self.backend.set_default_source(s["id"])
+                        break
         self._refresh_hardware_and_sinks()
         self._refresh_header_and_overview()
 
@@ -3335,7 +3872,22 @@ def run_tests():
     final_src = backend.get_capture_source("1")
     print(f"        OK: {msg_pin} | Active Capture Source={final_src}")
 
-    print(">>> All 13 verification tests PASSED successfully!")
+    print("[14/15] Testing PipeWire audio input sources (Microphones)...")
+    sources = backend.get_audio_sources(include_monitors=False)
+    assert len(sources) > 0, "No audio input sources found"
+    print(f"        OK: Found {len(sources)} input sources: {[s['name'] for s in sources]}")
+
+    print("[15/15] Testing Virtual Microphone (AudioRelay) setup & cleanup...")
+    ok_vmic, vmic_msg = backend.setup_virtual_mic(permanent=False)
+    assert ok_vmic, f"Failed to setup virtual mic: {vmic_msg}"
+    vstat = backend.get_virtual_mic_status()
+    assert vstat.get("active"), "Virtual microphone should be active"
+    print(f"        OK: Virtual mic setup succeeded: Sink ID {vstat.get('sink_id')}, Source ID {vstat.get('source_id')}")
+    ok_vrm, vrm_msg = backend.remove_virtual_mic()
+    assert ok_vrm, f"Failed to remove virtual mic: {vrm_msg}"
+    print(f"        OK: Virtual mic removed cleanly: {vrm_msg}")
+
+    print(">>> All 15 verification tests PASSED successfully!")
     return 0
 
 
@@ -3349,13 +3901,53 @@ def main():
     parser.add_argument("--rate", "-r", type=int, help="Set sample rate")
     parser.add_argument("--route", action="store_true", help="Execute auto-routing check once based on jack state")
     parser.add_argument("--simultaneous", choices=["on", "off"], help="Enable or disable simultaneous multi-output")
-    parser.add_argument("--mic", choices=["headset", "internal", "auto"], help="Switch microphone input ('headset', 'internal', or 'auto')")
+    parser.add_argument("--mic", choices=["headset", "internal", "auto", "virtual"], help="Switch microphone input ('headset', 'internal', 'auto', or 'virtual')")
+    parser.add_argument("--setup-virtual-mic", action="store_true", help="Set up AudioRelay virtual microphone")
+    parser.add_argument("--temp", action="store_true", help="Use session-only temporary mode for virtual mic")
+    parser.add_argument("--remove-virtual-mic", action="store_true", help="Remove AudioRelay virtual microphone")
+    parser.add_argument("--virtual-mic-status", action="store_true", help="Print AudioRelay virtual mic status")
+    parser.add_argument("--sources", action="store_true", help="List active audio input sources (microphones)")
+    parser.add_argument("--set-source", type=str, help="Set default microphone by ID or name")
     args = parser.parse_args()
 
     backend = AudioBackend()
 
     if args.test:
         sys.exit(run_tests())
+
+    if args.setup_virtual_mic:
+        permanent = not args.temp
+        ok, msg = backend.setup_virtual_mic(permanent=permanent)
+        print(msg)
+        sys.exit(0 if ok else 1)
+
+    if args.remove_virtual_mic:
+        ok, msg = backend.remove_virtual_mic()
+        print(msg)
+        sys.exit(0 if ok else 1)
+
+    if args.virtual_mic_status:
+        vstat = backend.get_virtual_mic_status()
+        print(f"Active:         {vstat.get('active')}")
+        print(f"Permanent:      {vstat.get('permanent')}")
+        print(f"Sink Name:      {vstat.get('sink_name')} (ID: {vstat.get('sink_id')})")
+        print(f"Source Name:    {vstat.get('source_name')} (ID: {vstat.get('source_id')})")
+        print(f"Default Source: {vstat.get('is_default_source')}")
+        sys.exit(0)
+
+    if args.sources:
+        sources = backend.get_audio_sources(include_monitors=False)
+        print("Active Audio Input Sources (Microphones):")
+        for s in sources:
+            def_marker = " [DEFAULT]" if s.get("is_default") else ""
+            virt_marker = " (Virtual)" if s.get("is_virtual") else ""
+            print(f"  [{s['id']}] {s['description'] or s['name']}{virt_marker}{def_marker} - Vol: {int(s['volume']*100)}% Muted: {s['muted']}")
+        sys.exit(0)
+
+    if args.set_source:
+        ok, msg = backend.set_default_source(args.set_source)
+        print(msg)
+        sys.exit(0 if ok else 1)
 
     if args.route:
         ok, msg = backend.apply_audio_routing()
@@ -3374,6 +3966,15 @@ def main():
             backend.set_smart_mic_auto_switch(True)
             ok, msg = backend.apply_audio_routing()
             print(f"Smart Mic Auto-Switch enabled: {msg}")
+            sys.exit(0 if ok else 1)
+        elif args.mic == "virtual":
+            stat = backend.get_virtual_mic_status()
+            if not stat.get("active"):
+                backend.setup_virtual_mic(permanent=True)
+                stat = backend.get_virtual_mic_status()
+            sid = stat.get("source_id") or "audiorelay-virtual-mic-sink"
+            ok, msg = backend.set_default_source(sid)
+            print(f"Virtual microphone selected: {msg}")
             sys.exit(0 if ok else 1)
         else:
             target = "Mic" if args.mic == "headset" else "Internal Mic"
